@@ -2,16 +2,45 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
+type Session = {
+  id: string;
+  state: string;
+  created_at: number;
+  updated_at?: number | null;
+  meta?: string | null;
+};
+
+type Action = {
+  id: string;
+  kind: string;
+  state: string;
+  created_at: number;
+};
+
+type Contract = {
+  id: string;
+  session_id: string;
+  title: string;
+  description?: string | null;
+  state: string;
+  version: number;
+  created_at: number;
+};
+
+type EvaluationResult = {
+  verdict?: string | null;
+};
+
 function App() {
-  const [sessions, setSessions] = useState<any[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const [actions, setActions] = useState<any[]>([]);
-  const [contracts, setContracts] = useState<any[]>([]);
+  const [actions, setActions] = useState<Action[]>([]);
+  const [contracts, setContracts] = useState<Contract[]>([]);
   const [verdict, setVerdict] = useState<string | null>(null);
 
   async function refreshSessions() {
-    const s: any = await invoke("list_sessions");
-    setSessions((s as any) || []);
+    const s = await invoke<Session[]>("list_sessions");
+    setSessions(s || []);
   }
 
   async function createSession() {
@@ -22,14 +51,17 @@ function App() {
 
   async function selectSession(id: string) {
     setSelectedSession(id);
-    const a: any = await invoke("list_actions", { sessionId: id });
+    setVerdict(null);
+
+    const a = await invoke<Action[]>("list_actions", { sessionId: id });
     setActions(a || []);
-    const c: any = await invoke("list_contracts");
-    setContracts(c || []);
+
+    const c = await invoke<Contract[]>("list_contracts");
+    setContracts((c || []).filter((contract) => contract.session_id === id));
   }
 
   async function evalContract(contractId: string) {
-    const r: any = await invoke("evaluate_contract", { contractId });
+    const r = await invoke<EvaluationResult>("evaluate_contract", { contractId });
     setVerdict(r?.verdict || null);
   }
 
