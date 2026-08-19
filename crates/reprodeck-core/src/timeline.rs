@@ -106,6 +106,17 @@ pub fn finish_execution(
         // redact common key=val patterns for token/password
         let kv = Regex::new(r"(?i)(password|token|secret)\s*[=:]\s*[^\s,;]+").unwrap();
         s = kv.replace_all(&s, "$1=[REDACTED]").into_owned();
+        // redact JWT-like tokens (three dot-separated base64url segments)
+        let jwt = Regex::new(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
+        s = jwt.replace_all(&s, "[REDACTED_JWT]").into_owned();
+        // redact AWS-style access keys (AKIA...)
+        let aws = Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
+        s = aws.replace_all(&s, "[REDACTED_AWS_KEY]").into_owned();
+        // redact long hex or base64-like tokens (heuristic)
+        let hex64 = Regex::new(r"\b[0-9a-fA-F]{40,64}\b").unwrap();
+        s = hex64.replace_all(&s, "[REDACTED_TOKEN]").into_owned();
+        let long_token = Regex::new(r"\b[A-Za-z0-9_\-]{40,}\b").unwrap();
+        s = long_token.replace_all(&s, "[REDACTED_TOKEN]").into_owned();
         s
     }
 
@@ -260,6 +271,27 @@ mod tests {
             .unwrap();
         assert!(!stored.contains("abcdef12345"));
         assert!(stored.contains("[REDACTED]") || stored.contains("REDACTED"));
+    }
+
+    #[test]
+    fn sanitization_detects_jwt_and_aws() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let mut conn = crate::db::init_db(path).expect("init db");
+        create_session(&conn, "s-sec2", "Active", None).unwrap();
+        let a = Action { id: "ajwt".to_string(), session_id: "s-sec2".to_string(), parent_id: None, kind: "k".to_string(), meta: None, state: "Created".to_string(), created_at: 1 };
+        create_action(&conn, &a).unwrap();
+        let exec_id = start_execution(&conn, "ajwt").unwrap();
+        // JWT without Bearer
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sgnature";
+        let aws = format!("AKIA{}", "A".repeat(16));
+        let input = format!("start {} middle {} end", jwt, aws);
+        let receipt = finish_execution(&mut conn, &exec_id, "Succeeded", Some(&input), None).unwrap();
+        let stored: String = conn.query_row("SELECT stdout_preview FROM receipts WHERE id = ?1", rusqlite::params![receipt], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("eyJhbGci"));
+        assert!(!stored.contains("AKIA"));
+        assert!(stored.contains("REDACTED_JWT") || stored.contains("REDACTED"));
+        assert!(stored.contains("REDACTED_AWS_KEY") || stored.contains("REDACTED_TOKEN") || stored.contains("REDACTED"));
     }
 
     #[test]

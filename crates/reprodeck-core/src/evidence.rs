@@ -21,7 +21,9 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
     // If an attacker pre-created a symlink at dir, refuse to proceed.
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
         if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact storage prefix is a symlink"));
+            return Err(std::io::Error::other(
+                "artifact storage prefix is a symlink",
+            ));
         }
     }
 
@@ -42,7 +44,9 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
     let dir_canon = dir.canonicalize()?;
     if !dir_canon.starts_with(&base) {
         let _ = fs::remove_file(&tmp);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact dir canonicalization outside storage root"));
+        return Err(std::io::Error::other(
+            "artifact dir canonicalization outside storage root",
+        ));
     }
 
     // atomic rename into final path
@@ -56,7 +60,9 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
     if !final_canon.starts_with(&base) {
         // attempt to remove the file we just created
         let _ = fs::remove_file(&finalp);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact stored outside storage root"));
+        return Err(std::io::Error::other(
+            "artifact stored outside storage root",
+        ));
     }
 
     Ok((checksum, finalp))
