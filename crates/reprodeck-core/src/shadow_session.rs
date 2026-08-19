@@ -1,9 +1,12 @@
 use crate::git_shadow::{GitShadowError, Shadow};
 use crate::repository::{self, RepositoryError};
+use crate::timeline::TimelineError;
 use git2::{Delta, DiffFindOptions, DiffOptions, IndexAddOption, Repository, Signature};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,6 +19,10 @@ pub enum ShadowSessionError {
     Shadow(#[from] GitShadowError),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    Timeline(#[from] TimelineError),
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
     #[error("session has no attached repository: {0}")]
     RepositoryNotAttached(String),
     #[error("shadow workspace not found for session: {0}")]
@@ -69,24 +76,27 @@ fn record_from_row(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<ShadowWorkspaceRecord>> {
-    let row: Option<(String, String, String, String)> = conn
+    let row: Option<(String, String, String, String, String)> = conn
         .query_row(
-            "SELECT sw.repo_id, r.path, sw.base_commit, sw.branch
+            "SELECT sw.repo_id, r.path, sw.base_commit, sw.branch, sw.worktree_path
              FROM shadow_workspaces sw
              JOIN repositories r ON r.id = sw.repo_id
              WHERE sw.id = ?1",
             rusqlite::params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((repo_id, repo_path, base_commit, branch)) = row else {
+    let Some((repo_id, repo_path, base_commit, branch, worktree_path)) = row else {
         return Ok(None);
     };
-    let worktree_path: String = conn.query_row(
-        "SELECT worktree_path FROM shadow_workspaces WHERE id = ?1",
-        rusqlite::params![session_id],
-        |row| row.get(0),
-    )?;
     let original_branch = repository::inspect_repository(Path::new(&repo_path))?.branch;
     Ok(Some(ShadowWorkspaceRecord {
         session_id: session_id.to_owned(),
@@ -115,13 +125,13 @@ pub fn create_session_shadow(
     }
 
     let session = crate::timeline::get_session_record(conn, session_id)?
-        .ok_or_else(|| ShadowSessionError::ShadowNotFound(session_id.to_owned()))?;
+        .ok_or_else(|| ShadowSessionError::SessionNotFound(session_id.to_owned()))?;
     let repo_id = session
         .repo_id
         .ok_or_else(|| ShadowSessionError::RepositoryNotAttached(session_id.to_owned()))?;
-    let repository = repository::get_session_repository(conn, session_id)?
+    let attached = repository::get_session_repository(conn, session_id)?
         .ok_or_else(|| ShadowSessionError::RepositoryNotAttached(session_id.to_owned()))?;
-    let shadow = Shadow::create(Path::new(&repository.path), None)?;
+    let shadow = Shadow::create(Path::new(&attached.path), None)?;
 
     let insert = conn.execute(
         "INSERT INTO shadow_workspaces(id, repo_id, base_commit, branch, worktree_path)
@@ -307,7 +317,6 @@ pub fn discard_session_shadow(conn: &Connection, session_id: &str) -> Result<()>
 mod tests {
     use super::*;
     use crate::{db::init_db, timeline};
-    use git2::{IndexAddOption, Signature};
     use tempfile::{tempdir, NamedTempFile};
 
     fn init_repo(path: &Path) {
@@ -392,6 +401,16 @@ mod tests {
         assert!(matches!(
             create_session_shadow(&conn, "session"),
             Err(ShadowSessionError::RepositoryNotAttached(_))
+        ));
+    }
+
+    #[test]
+    fn missing_session_is_rejected() {
+        let db_file = NamedTempFile::new().unwrap();
+        let conn = init_db(db_file.path()).unwrap();
+        assert!(matches!(
+            create_session_shadow(&conn, "missing"),
+            Err(ShadowSessionError::SessionNotFound(_))
         ));
     }
 
