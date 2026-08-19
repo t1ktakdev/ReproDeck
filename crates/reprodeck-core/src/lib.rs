@@ -12,6 +12,7 @@ pub mod recovery;
 pub mod redaction;
 pub mod repository;
 pub mod runner;
+pub mod shadow_session;
 pub mod timeline;
 pub mod verification;
 pub mod verification_exec;
