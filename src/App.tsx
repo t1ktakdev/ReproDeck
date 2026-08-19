@@ -56,8 +56,8 @@ function App() {
     const a = await invoke<Action[]>("list_actions", { sessionId: id });
     setActions(a || []);
 
-    const c = await invoke<Contract[]>("list_contracts");
-    setContracts((c || []).filter((contract) => contract.session_id === id));
+    const c = await invoke<Contract[]>("list_contracts", { sessionId: id });
+    setContracts(c || []);
   }
 
   async function evalContract(contractId: string) {
