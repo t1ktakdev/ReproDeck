@@ -27,6 +27,15 @@ pub enum VerificationExecutionError {
 
 pub type Result<T> = std::result::Result<T, VerificationExecutionError>;
 
+#[derive(Debug)]
+pub struct VerificationExecutionRequest {
+    pub contract_id: String,
+    pub check_id: String,
+    pub phase: RunPhase,
+    pub spec: CommandSpec,
+    pub configured_permission: Permission,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationExecutionOutcome {
     pub run_id: String,
@@ -46,12 +55,8 @@ fn phase_role(phase: RunPhase) -> ArtifactRole {
     }
 }
 
-fn redacted_command_meta(
-    contract_id: &str,
-    check_id: &str,
-    phase: RunPhase,
-    spec: &CommandSpec,
-) -> serde_json::Value {
+fn redacted_command_meta(request: &VerificationExecutionRequest) -> serde_json::Value {
+    let spec = &request.spec;
     let args: Vec<String> = spec
         .args
         .iter()
@@ -72,9 +77,9 @@ fn redacted_command_meta(
     });
 
     serde_json::json!({
-        "contract_id": contract_id,
-        "check_id": check_id,
-        "phase": phase.to_string(),
+        "contract_id": request.contract_id,
+        "check_id": request.check_id,
+        "phase": request.phase.to_string(),
         "command": {
             "executable": redaction::redact_text(&spec.executable),
             "args": args,
@@ -134,17 +139,13 @@ fn persist_output(
 pub fn execute_verification_check(
     conn: &mut Connection,
     storage_dir: &Path,
-    contract_id: &str,
-    check_id: &str,
-    phase: RunPhase,
-    spec: CommandSpec,
-    configured_permission: Permission,
+    request: VerificationExecutionRequest,
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<VerificationExecutionOutcome> {
     let decision = permissions::verification_command_permission(
-        &spec.executable,
-        &spec.args,
-        configured_permission,
+        &request.spec.executable,
+        &request.spec.args,
+        request.configured_permission,
     );
     match decision.permission {
         Permission::Deny => {
@@ -156,14 +157,19 @@ pub fn execute_verification_check(
         Permission::Allow => {}
     }
 
-    let command_meta = redacted_command_meta(contract_id, check_id, phase, &spec);
-    let run_id = verification::start_verification_check_run(conn, contract_id, check_id, phase)?;
+    let command_meta = redacted_command_meta(&request);
+    let run_id = verification::start_verification_check_run(
+        conn,
+        &request.contract_id,
+        &request.check_id,
+        request.phase,
+    )?;
     conn.execute(
         "UPDATE actions SET meta = ?1 WHERE id = ?2",
         rusqlite::params![serde_json::to_string(&command_meta)?, &run_id],
     )?;
 
-    match runner::run_command(spec, Permission::Allow, cancel_token) {
+    match runner::run_command(request.spec, Permission::Allow, cancel_token) {
         Ok(result) => {
             let status = if result.exit_code == Some(0) {
                 RunStatus::Passed
@@ -184,7 +190,7 @@ pub fn execute_verification_check(
                 storage_dir,
                 &receipt_id,
                 &run_id,
-                phase_role(phase),
+                phase_role(request.phase),
                 &stdout,
             )?;
             let stderr_artifact_id = persist_output(
@@ -198,7 +204,7 @@ pub fn execute_verification_check(
             Ok(VerificationExecutionOutcome {
                 run_id,
                 receipt_id,
-                phase,
+                phase: request.phase,
                 status,
                 exit_code: result.exit_code,
                 stdout_artifact_id,
@@ -227,7 +233,7 @@ pub fn execute_verification_check(
             Ok(VerificationExecutionOutcome {
                 run_id,
                 receipt_id,
-                phase,
+                phase: request.phase,
                 status,
                 exit_code: None,
                 stdout_artifact_id: None,
@@ -284,6 +290,22 @@ mod tests {
         }
     }
 
+    fn request(
+        contract: &verification::OutcomeContract,
+        check: &verification::VerificationCheck,
+        phase: RunPhase,
+        spec: CommandSpec,
+        permission: Permission,
+    ) -> VerificationExecutionRequest {
+        VerificationExecutionRequest {
+            contract_id: contract.id.clone(),
+            check_id: check.id.clone(),
+            phase,
+            spec,
+            configured_permission: permission,
+        }
+    }
+
     fn run_count(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM verification_runs", [], |row| {
             row.get(0)
@@ -298,11 +320,13 @@ mod tests {
         let result = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-            git_spec(&["--version"]),
-            Permission::Ask,
+            request(
+                &contract,
+                &check,
+                RunPhase::Before,
+                git_spec(&["--version"]),
+                Permission::Ask,
+            ),
             None,
         );
         assert!(matches!(
@@ -319,11 +343,13 @@ mod tests {
         let result = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-            git_spec(&["--version"]),
-            Permission::Deny,
+            request(
+                &contract,
+                &check,
+                RunPhase::Before,
+                git_spec(&["--version"]),
+                Permission::Deny,
+            ),
             None,
         );
         assert!(matches!(
@@ -340,11 +366,13 @@ mod tests {
         let outcome = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-            git_spec(&["--version"]),
-            Permission::Allow,
+            request(
+                &contract,
+                &check,
+                RunPhase::Before,
+                git_spec(&["--version"]),
+                Permission::Allow,
+            ),
             None,
         )
         .unwrap();
@@ -372,15 +400,17 @@ mod tests {
         let outcome = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::After,
-            git_spec(&[
-                "rev-parse",
-                "--verify",
-                "refs/heads/reprodeck-definitely-missing",
-            ]),
-            Permission::Allow,
+            request(
+                &contract,
+                &check,
+                RunPhase::After,
+                git_spec(&[
+                    "rev-parse",
+                    "--verify",
+                    "refs/heads/reprodeck-definitely-missing",
+                ]),
+                Permission::Allow,
+            ),
             None,
         )
         .unwrap();
@@ -397,11 +427,13 @@ mod tests {
         let outcome = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::After,
-            git_spec(&["--version"]),
-            Permission::Allow,
+            request(
+                &contract,
+                &check,
+                RunPhase::After,
+                git_spec(&["--version"]),
+                Permission::Allow,
+            ),
             Some(token),
         )
         .unwrap();
@@ -421,11 +453,13 @@ mod tests {
         let result = execute_verification_check(
             &mut conn,
             storage.path(),
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-            git_spec(&["push"]),
-            Permission::Allow,
+            request(
+                &contract,
+                &check,
+                RunPhase::Before,
+                git_spec(&["push"]),
+                Permission::Allow,
+            ),
             None,
         );
         assert!(matches!(
