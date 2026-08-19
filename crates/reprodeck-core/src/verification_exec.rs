@@ -74,10 +74,9 @@ fn parse_expected_exit_code(condition: Option<&str>) -> Result<i32> {
 
     let lower = condition.to_ascii_lowercase();
     if let Some(value) = lower.strip_prefix("exit ") {
-        return value
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| VerificationExecutionError::UnsupportedExpectedCondition(condition.into()));
+        return value.trim().parse::<i32>().map_err(|_| {
+            VerificationExecutionError::UnsupportedExpectedCondition(condition.into())
+        });
     }
 
     let compact: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -444,13 +443,7 @@ mod tests {
             Permission::Ask,
         );
         request.explicitly_approved_once = true;
-        let outcome = execute_verification_check(
-            &mut conn,
-            storage.path(),
-            request,
-            None,
-        )
-        .unwrap();
+        let outcome = execute_verification_check(&mut conn, storage.path(), request, None).unwrap();
         assert_eq!(outcome.status, RunStatus::Passed);
         assert_eq!(run_count(&conn), 1);
     }
@@ -577,12 +570,7 @@ mod tests {
             Permission::Allow,
         );
         request.explicitly_approved_once = true;
-        let result = execute_verification_check(
-            &mut conn,
-            storage.path(),
-            request,
-            None,
-        );
+        let result = execute_verification_check(&mut conn, storage.path(), request, None);
         assert!(matches!(
             result,
             Err(VerificationExecutionError::PermissionDenied { .. })

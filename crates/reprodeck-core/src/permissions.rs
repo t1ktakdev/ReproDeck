@@ -223,11 +223,8 @@ mod tests {
     #[test]
     fn opaque_shell_requires_approval_but_can_be_approved_once() {
         let shell_args = args(&["-Command", "cargo test"]);
-        let first = verification_command_permission(
-            "powershell.exe",
-            &shell_args,
-            Permission::Allow,
-        );
+        let first =
+            verification_command_permission("powershell.exe", &shell_args, Permission::Allow);
         assert_eq!(first.permission, Permission::Ask);
         assert_eq!(first.reason, PermissionReason::OpaqueShellCommand);
 
