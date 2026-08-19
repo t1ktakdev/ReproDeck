@@ -10,6 +10,7 @@ pub mod permissions;
 pub mod platform;
 pub mod recovery;
 pub mod redaction;
+pub mod repository;
 pub mod runner;
 pub mod timeline;
 pub mod verification;
