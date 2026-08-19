@@ -14,6 +14,21 @@ Resume from the actual workspace, current git diff, active OpenSpec change, and 
 ## Baseline commit
 - Core Foundation baseline commit SHA: 596016fc883dceb34e5fe58acee349d56551c1ab
 
+## Timeline + Evidence checkpoint
+- Timeline/Evidence HEAD (local): fb9e765a818cba57d100bcc3b7e0abd73f49237c
+- reprodeck-core tests (this checkpoint): 53 passed
+- Locked quality gate (this checkpoint): QUALITY_GATE_PASS
+- Code review judge (GPT-OSS-120B): VERDICT: PASS
+- Security review judge (GPT-OSS-120B): VERDICT: PASS
+
+### Remaining backlog (recorded)
+- MEDIUM: Expand sanitization to full artifact contents and broader token formats; consider a vetted secret-detection library and entropy heuristics.
+- MEDIUM: Enforce artifact size quotas and implement GC for stored artifacts.
+- MEDIUM: Audit unsafe/FFI code paths and add soundness comments and tests.
+- MEDIUM: Replace critical unwrap/expect in migration/runtime paths with Result propagation (backlog item).
+
+Next checkpoint: none — TIMELINE + EVIDENCE FOUNDATION implemented and ready for acceptance artifacts (code+security evidence & judges). 
+
 ## Next exact actions
 1. Inspect current git diff and unresolved audit findings.
 2. Fix the highest-severity unblocked issue.
