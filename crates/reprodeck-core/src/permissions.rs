@@ -186,11 +186,8 @@ mod tests {
     #[test]
     fn mutating_git_commands_require_approval() {
         for subcommand in ["push", "commit", "reset", "clean", "rebase", "worktree"] {
-            let decision = verification_command_permission(
-                "git.exe",
-                &args(&[subcommand]),
-                Permission::Allow,
-            );
+            let decision =
+                verification_command_permission("git.exe", &args(&[subcommand]), Permission::Allow);
             assert_eq!(decision.permission, Permission::Ask, "{subcommand}");
             assert_eq!(decision.reason, PermissionReason::UnsafeVerificationCommand);
         }
@@ -199,11 +196,8 @@ mod tests {
     #[test]
     fn read_only_git_commands_can_run_when_allowed() {
         for subcommand in ["status", "diff", "rev-parse", "show"] {
-            let decision = verification_command_permission(
-                "git",
-                &args(&[subcommand]),
-                Permission::Allow,
-            );
+            let decision =
+                verification_command_permission("git", &args(&[subcommand]), Permission::Allow);
             assert_eq!(decision.permission, Permission::Allow, "{subcommand}");
         }
     }
