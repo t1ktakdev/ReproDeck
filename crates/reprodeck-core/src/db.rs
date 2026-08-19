@@ -80,6 +80,59 @@ const MIGRATIONS: &[(&str, &str)] = &[
             spec TEXT NOT NULL
         );
         INSERT OR IGNORE INTO reprodeck_meta (key, value) VALUES ('schema_version', '1');",
+    (
+        "3",
+        -- migration 3: actions, executions, receipts, artifacts
+        "CREATE TABLE IF NOT EXISTS actions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            parent_id TEXT,
+            kind TEXT NOT NULL,
+            meta TEXT,
+            state TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_actions_session ON actions(session_id);
+
+        CREATE TABLE IF NOT EXISTS executions (
+            id TEXT PRIMARY KEY,
+            action_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            duration_ms INTEGER,
+            FOREIGN KEY(action_id) REFERENCES actions(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_executions_action ON executions(action_id);
+
+        CREATE TABLE IF NOT EXISTS receipts (
+            id TEXT PRIMARY KEY,
+            execution_id TEXT NOT NULL,
+            summary TEXT,
+            stdout_preview TEXT,
+            stderr_preview TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(execution_id) REFERENCES executions(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_receipts_execution ON receipts(execution_id);
+
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL,
+            store_key TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            media_type TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(receipt_id) REFERENCES receipts(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_artifacts_receipt ON artifacts(receipt_id);
+        "
     ),
 ];
 
