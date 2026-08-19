@@ -13,3 +13,4 @@ pub mod redaction;
 pub mod runner;
 pub mod timeline;
 pub mod verification;
+pub mod verification_exec;
