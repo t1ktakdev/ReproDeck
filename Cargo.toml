@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["ReproDeck Team"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/user/reprodeck"
+repository = "https://github.com/t1ktakdev/ReproDeck"
 
 [profile.release]
 codegen-units = 1
