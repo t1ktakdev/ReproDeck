@@ -28,7 +28,9 @@ pub enum GitShadowError {
     UnsupportedPathEncoding,
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    #[error("apply failed and rollback also failed; apply={apply_error}; rollback={rollback_error}")]
+    #[error(
+        "apply failed and rollback also failed; apply={apply_error}; rollback={rollback_error}"
+    )]
     RollbackFailed {
         apply_error: String,
         rollback_error: String,
@@ -125,7 +127,11 @@ struct Mutation {
     desired: DesiredState,
 }
 
-fn file_state_from_diff(repo: &Repository, file: DiffFile<'_>, path: &Path) -> Result<DesiredState> {
+fn file_state_from_diff(
+    repo: &Repository,
+    file: DiffFile<'_>,
+    path: &Path,
+) -> Result<DesiredState> {
     let executable = mode_is_executable(file.mode(), path)?;
     let blob = repo.find_blob(file.id())?;
     Ok(DesiredState::File {
@@ -473,7 +479,10 @@ fn atomic_write(path: &Path, data: &[u8], permissions: Option<Permissions>) -> i
     let temp = parent.join(format!(".reprodeck-write-{}.tmp", Uuid::new_v4()));
 
     let result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
@@ -512,11 +521,7 @@ fn apply_mutation(repo: &Path, mutation: &Mutation, snapshot: &SnapshotState) ->
                 fs::create_dir_all(parent)?;
             }
             ensure_path_within_repo(repo, &mutation.path)?;
-            atomic_write(
-                &absolute,
-                data,
-                desired_permissions(snapshot, *executable),
-            )?;
+            atomic_write(&absolute, data, desired_permissions(snapshot, *executable))?;
         }
     }
     Ok(())
@@ -595,7 +600,9 @@ impl Shadow {
         let discovered = Repository::discover(repo)?;
         let repo_root = discovered
             .workdir()
-            .ok_or_else(|| GitShadowError::PatchApplyFailed("bare repositories are not supported".to_string()))?
+            .ok_or_else(|| {
+                GitShadowError::PatchApplyFailed("bare repositories are not supported".to_string())
+            })?
             .canonicalize()?;
         let head = discovered
             .head()
@@ -615,7 +622,8 @@ impl Shadow {
         let worktree = std::env::temp_dir().join(format!("reprodeck-shadow-{}", Uuid::new_v4()));
         fs::create_dir_all(&worktree)?;
         let branch = format!("reprodeck-shadow-{}", Uuid::new_v4());
-        if let Err(error) = run_worktree_add(&repo_root, &branch, &worktree, &base_oid.to_string()) {
+        if let Err(error) = run_worktree_add(&repo_root, &branch, &worktree, &base_oid.to_string())
+        {
             let _ = fs::remove_dir_all(&worktree);
             return Err(error);
         }
@@ -682,7 +690,11 @@ impl Shadow {
     /// same rollback path.
     pub fn apply(self) -> Result<()> {
         if !self.repo.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "original repository no longer exists").into());
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "original repository no longer exists",
+            )
+            .into());
         }
         let repo = Repository::open(&self.repo)?;
         let current_head = repo
@@ -741,10 +753,8 @@ impl Shadow {
         }
 
         if let Err(cleanup_error) = self.discard() {
-            let marker = std::env::temp_dir().join(format!(
-                "reprodeck-recovery-{}.txt",
-                Uuid::new_v4()
-            ));
+            let marker =
+                std::env::temp_dir().join(format!("reprodeck-recovery-{}.txt", Uuid::new_v4()));
             let message = format!(
                 "apply succeeded; cleanup pending\nrepo={:?}\nworktree={:?}\nbranch={}\nerror={}\n",
                 self.repo, self.worktree, self.branch, cleanup_error
@@ -1039,6 +1049,13 @@ mod tests {
         fs::set_permissions(&path, permissions).unwrap();
         shadow.commit_all("executable").unwrap();
         shadow.apply().unwrap();
-        assert_ne!(fs::metadata(repo.join("run.sh")).unwrap().permissions().mode() & 0o111, 0);
+        assert_ne!(
+            fs::metadata(repo.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
     }
 }
