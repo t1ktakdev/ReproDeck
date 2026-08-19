@@ -85,15 +85,11 @@ fn long_token_regex() -> &'static Regex {
 }
 
 fn sanitize_preview(input: &str) -> String {
-    let mut s = bearer_regex()
-        .replace_all(input, "[REDACTED]")
-        .into_owned();
+    let mut s = bearer_regex().replace_all(input, "[REDACTED]").into_owned();
     s = key_value_regex()
         .replace_all(&s, "$1=[REDACTED]")
         .into_owned();
-    s = jwt_regex()
-        .replace_all(&s, "[REDACTED_JWT]")
-        .into_owned();
+    s = jwt_regex().replace_all(&s, "[REDACTED_JWT]").into_owned();
     s = aws_key_regex()
         .replace_all(&s, "[REDACTED_AWS_KEY]")
         .into_owned();
@@ -221,13 +217,8 @@ pub fn finish_execution(
     stderr_preview: Option<&str>,
 ) -> Result<String, TimelineError> {
     let tx = conn.transaction()?;
-    let receipt_id = finish_execution_in_transaction(
-        &tx,
-        execution_id,
-        status,
-        stdout_preview,
-        stderr_preview,
-    )?;
+    let receipt_id =
+        finish_execution_in_transaction(&tx, execution_id, status, stdout_preview, stderr_preview)?;
     tx.commit()?;
     Ok(receipt_id)
 }

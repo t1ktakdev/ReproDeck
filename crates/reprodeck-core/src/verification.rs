@@ -486,7 +486,12 @@ mod tests {
     use crate::db::init_db;
     use tempfile::NamedTempFile;
 
-    fn setup() -> (NamedTempFile, Connection, OutcomeContract, VerificationCheck) {
+    fn setup() -> (
+        NamedTempFile,
+        Connection,
+        OutcomeContract,
+        VerificationCheck,
+    ) {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).expect("init db");
         conn.execute(
