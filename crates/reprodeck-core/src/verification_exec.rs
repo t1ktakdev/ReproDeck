@@ -15,6 +15,8 @@ pub enum VerificationExecutionError {
     PermissionDenied { decision: PermissionDecision },
     #[error("verification command requires approval: {decision:?}")]
     DecisionRequired { decision: PermissionDecision },
+    #[error("unsupported verification expected condition: {0}")]
+    UnsupportedExpectedCondition(String),
     #[error(transparent)]
     Verification(#[from] verification::VerificationError),
     #[error(transparent)]
@@ -55,7 +57,57 @@ fn phase_role(phase: RunPhase) -> ArtifactRole {
     }
 }
 
-fn redacted_command_meta(request: &VerificationExecutionRequest) -> serde_json::Value {
+/// Outcome checks currently support a deliberately small, deterministic
+/// condition language. An absent condition means the conventional `exit 0`.
+/// Anything richer is rejected instead of being silently interpreted as pass.
+fn parse_expected_exit_code(condition: Option<&str>) -> Result<i32> {
+    let Some(condition) = condition else {
+        return Ok(0);
+    };
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return Ok(0);
+    }
+
+    let lower = condition.to_ascii_lowercase();
+    if let Some(value) = lower.strip_prefix("exit ") {
+        return value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| VerificationExecutionError::UnsupportedExpectedCondition(condition.into()));
+    }
+
+    let compact: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
+    for prefix in ["exit_code==", "exit_code=", "exit==", "exit="] {
+        if let Some(value) = compact.strip_prefix(prefix) {
+            return value.parse::<i32>().map_err(|_| {
+                VerificationExecutionError::UnsupportedExpectedCondition(condition.into())
+            });
+        }
+    }
+
+    Err(VerificationExecutionError::UnsupportedExpectedCondition(
+        condition.into(),
+    ))
+}
+
+fn get_check(
+    conn: &Connection,
+    contract_id: &str,
+    check_id: &str,
+) -> Result<verification::VerificationCheck> {
+    verification::list_verification_checks(conn, contract_id)?
+        .into_iter()
+        .find(|check| check.id == check_id)
+        .ok_or_else(|| {
+            verification::VerificationError::CheckNotFound(check_id.to_owned()).into()
+        })
+}
+
+fn redacted_command_meta(
+    request: &VerificationExecutionRequest,
+    expected_exit_code: i32,
+) -> serde_json::Value {
     let spec = &request.spec;
     let args: Vec<String> = spec
         .args
@@ -80,6 +132,7 @@ fn redacted_command_meta(request: &VerificationExecutionRequest) -> serde_json::
         "contract_id": request.contract_id,
         "check_id": request.check_id,
         "phase": request.phase.to_string(),
+        "expected_exit_code": expected_exit_code,
         "command": {
             "executable": redaction::redact_text(&spec.executable),
             "args": args,
@@ -130,18 +183,18 @@ fn persist_output(
 }
 
 /// Execute one BEFORE/AFTER verification check through the accepted runner.
-///
-/// Permission is evaluated before any Timeline/Verification row is created.
-/// Once a run starts, every runner termination path is persisted as a finished
-/// verification run and Timeline receipt, so crashes are not represented as
-/// successful proof and ordinary command failures are not confused with runner
-/// failures.
+/// Permission and expected-condition validation happen before any run is
+/// created. Once a run starts, every runner termination path is persisted as a
+/// finished verification run and Timeline receipt.
 pub fn execute_verification_check(
     conn: &mut Connection,
     storage_dir: &Path,
     request: VerificationExecutionRequest,
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<VerificationExecutionOutcome> {
+    let check = get_check(conn, &request.contract_id, &request.check_id)?;
+    let expected_exit_code = parse_expected_exit_code(check.expected_condition.as_deref())?;
+
     let decision = permissions::verification_command_permission(
         &request.spec.executable,
         &request.spec.args,
@@ -157,7 +210,7 @@ pub fn execute_verification_check(
         Permission::Allow => {}
     }
 
-    let command_meta = redacted_command_meta(&request);
+    let command_meta = redacted_command_meta(&request, expected_exit_code);
     let run_id = verification::start_verification_check_run(
         conn,
         &request.contract_id,
@@ -171,7 +224,7 @@ pub fn execute_verification_check(
 
     match runner::run_command(request.spec, Permission::Allow, cancel_token) {
         Ok(result) => {
-            let status = if result.exit_code == Some(0) {
+            let status = if result.exit_code == Some(expected_exit_code) {
                 RunStatus::Passed
             } else {
                 RunStatus::Failed
@@ -311,6 +364,43 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn expected_condition_parser_is_deliberately_small() {
+        assert_eq!(parse_expected_exit_code(None).unwrap(), 0);
+        assert_eq!(parse_expected_exit_code(Some("exit 0")).unwrap(), 0);
+        assert_eq!(parse_expected_exit_code(Some("exit_code == 17")).unwrap(), 17);
+        assert_eq!(parse_expected_exit_code(Some("exit=-1")).unwrap(), -1);
+        assert!(matches!(
+            parse_expected_exit_code(Some("stdout contains success")),
+            Err(VerificationExecutionError::UnsupportedExpectedCondition(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_expectation_is_rejected_before_creating_run() {
+        let (_db, mut conn, contract, mut check) = setup();
+        check.expected_condition = Some("stdout contains success".to_string());
+        verification::update_verification_check(&conn, &check).unwrap();
+        let storage = tempdir().unwrap();
+        let result = execute_verification_check(
+            &mut conn,
+            storage.path(),
+            request(
+                &contract,
+                &check,
+                RunPhase::Before,
+                git_spec(&["--version"]),
+                Permission::Allow,
+            ),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(VerificationExecutionError::UnsupportedExpectedCondition(_))
+        ));
+        assert_eq!(run_count(&conn), 0);
     }
 
     #[test]
