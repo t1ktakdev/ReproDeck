@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/*", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ReproDeck Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/reprodeck"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

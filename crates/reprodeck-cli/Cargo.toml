@@ -1,0 +1,17 @@
+[package]
+name = "reprodeck-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reprodeck"
+path = "src/main.rs"
+
+[dependencies]
+reprodeck-core = { path = "../reprodeck-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
