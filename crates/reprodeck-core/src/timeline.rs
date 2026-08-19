@@ -192,6 +192,23 @@ mod tests {
     }
 
     #[test]
+    fn sanitization_precedes_persistence() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let mut conn = crate::db::init_db(path).expect("init db");
+        create_session(&conn, "s-sec", "Active", None).unwrap();
+        let a = Action { id: "asec".to_string(), session_id: "s-sec".to_string(), parent_id: None, kind: "k".to_string(), meta: None, state: "Created".to_string(), created_at: 1 };
+        create_action(&conn, &a).unwrap();
+        let exec_id = start_execution(&conn, "asec").unwrap();
+        // include a bearer token in stdout
+        let token = "This has Bearer abcdef12345== inside";
+        let receipt = finish_execution(&mut conn, &exec_id, "Succeeded", Some(token), None).unwrap();
+        let stored: String = conn.query_row("SELECT stdout_preview FROM receipts WHERE id = ?1", rusqlite::params![receipt], |r| r.get(0)).unwrap();
+        assert!(!stored.contains("abcdef12345"));
+        assert!(stored.contains("[REDACTED]") || stored.contains("REDACTED"));
+    }
+
+    #[test]
     fn session_action_foreign_key() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();

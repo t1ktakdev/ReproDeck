@@ -50,4 +50,24 @@ mod tests {
         // ensure containment under storage dir
         assert!(path.starts_with(dir.path()));
     }
+
+    #[test]
+    fn duplicate_artifact_idempotent() {
+        let dir = tempdir().unwrap();
+        let data = b"same content";
+        let (c1, p1) = store_artifact(dir.path(), data).unwrap();
+        let (c2, p2) = store_artifact(dir.path(), data).unwrap();
+        assert_eq!(c1, c2);
+        assert!(p1.exists());
+        assert!(p2.exists());
+    }
+
+    #[test]
+    fn path_within_storage_detects_outside() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("foo");
+        std::fs::write(&outside_file, b"x").unwrap();
+        assert!(!path_within_storage(dir.path(), &outside_file));
+    }
 }
