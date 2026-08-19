@@ -1,10 +1,9 @@
-
+use regex::Regex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use regex::Regex;
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Action {
@@ -31,8 +30,16 @@ pub enum TimelineError {
     Db(#[from] rusqlite::Error),
 }
 
-pub fn create_session(conn: &Connection, public_id: &str, state: &str, meta: Option<&str>) -> Result<(), TimelineError> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+pub fn create_session(
+    conn: &Connection,
+    public_id: &str,
+    state: &str,
+    meta: Option<&str>,
+) -> Result<(), TimelineError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     conn.execute(
         "INSERT INTO sessions (id, created_at, updated_at, state, meta) VALUES (?1,?2,?3,?4,?5)",
         rusqlite::params![public_id, now, now, state, meta],
@@ -40,7 +47,10 @@ pub fn create_session(conn: &Connection, public_id: &str, state: &str, meta: Opt
     Ok(())
 }
 
-pub fn get_session(conn: &Connection, public_id: &str) -> Result<Option<(String,i64)>, TimelineError> {
+pub fn get_session(
+    conn: &Connection,
+    public_id: &str,
+) -> Result<Option<(String, i64)>, TimelineError> {
     let mut stmt = conn.prepare("SELECT id, created_at FROM sessions WHERE id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![public_id])?;
     if let Some(r) = rows.next()? {
@@ -54,19 +64,37 @@ pub fn get_session(conn: &Connection, public_id: &str) -> Result<Option<(String,
 
 pub fn start_execution(conn: &Connection, action_id: &str) -> Result<String, TimelineError> {
     let exec_id = Uuid::new_v4().to_string();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
 
-    conn.execute("INSERT INTO executions (id, action_id, status, started_at) VALUES (?1,?2,?3,?4)", rusqlite::params![exec_id, action_id, "Running", now])?;
+    conn.execute(
+        "INSERT INTO executions (id, action_id, status, started_at) VALUES (?1,?2,?3,?4)",
+        rusqlite::params![exec_id, action_id, "Running", now],
+    )?;
     Ok(exec_id)
 }
 
 /// finish_execution inserts receipt and optional artifact metadata atomically.
-pub fn finish_execution(conn: &mut Connection, execution_id: &str, status: &str, stdout_preview: Option<&str>, stderr_preview: Option<&str>) -> Result<String, TimelineError> {
+pub fn finish_execution(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+    stdout_preview: Option<&str>,
+    stderr_preview: Option<&str>,
+) -> Result<String, TimelineError> {
     let tx = conn.transaction()?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
 
     // update execution
-    tx.execute("UPDATE executions SET status = ?1, finished_at = ?2 WHERE id = ?3", rusqlite::params![status, now, execution_id])?;
+    tx.execute(
+        "UPDATE executions SET status = ?1, finished_at = ?2 WHERE id = ?3",
+        rusqlite::params![status, now, execution_id],
+    )?;
 
     // insert receipt
     let receipt_id = Uuid::new_v4().to_string();
@@ -122,16 +150,17 @@ pub fn recover_running(conn: &mut Connection) -> Result<usize, TimelineError> {
 }
 
 #[cfg(test)]
+#[allow(unused_mut)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use crate::db::init_db;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn create_and_read_action() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let conn = init_db(path).expect("init db");
+        let mut conn = init_db(path).expect("init db");
 
         let a = Action {
             id: "act-1".to_string(),
@@ -148,7 +177,9 @@ mod tests {
 
         create_action(&conn, &a).expect("insert");
 
-        let mut stmt = conn.prepare("SELECT id, session_id, kind FROM actions WHERE id = ?1").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, session_id, kind FROM actions WHERE id = ?1")
+            .unwrap();
         let mut rows = stmt.query(rusqlite::params!["act-1"]).unwrap();
         let row = rows.next().unwrap().unwrap();
         let id: String = row.get(0).unwrap();
@@ -159,7 +190,7 @@ mod tests {
     fn duplicate_uuid_rejected() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let conn = crate::db::init_db(path).expect("init db");
+        let mut conn = crate::db::init_db(path).expect("init db");
         // insert session with duplicate id
         conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",1,1,"Active"]).unwrap();
         let res = conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",2,2,"Active"]);
@@ -170,7 +201,7 @@ mod tests {
     fn action_ordering_and_pagination() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let conn = crate::db::init_db(path).expect("init db");
+        let mut conn = crate::db::init_db(path).expect("init db");
         conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-pag","r",1,1,"Active"]).unwrap();
 
         // insert multiple actions with same created_at
@@ -180,15 +211,23 @@ mod tests {
         }
 
         // pagination by created_seq stable ordering
-        let mut stmt = conn.prepare("SELECT id FROM actions WHERE session_id = ?1 ORDER BY created_seq LIMIT 2") .unwrap();
-        let rows = stmt.query_map(rusqlite::params!["s-pag"], |r| r.get::<_,String>(0)).unwrap();
-        let mut ids: Vec<String> = rows.map(|r| r.unwrap()).collect();
+        let mut stmt = conn
+            .prepare("SELECT id FROM actions WHERE session_id = ?1 ORDER BY created_seq LIMIT 2")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params!["s-pag"], |r| r.get::<_, String>(0))
+            .unwrap();
+        let ids: Vec<String> = rows.map(|r| r.unwrap()).collect();
         assert_eq!(ids.len(), 2);
         // next page
         let mut stmt2 = conn.prepare("SELECT id FROM actions WHERE session_id = ?1 AND created_seq > (SELECT created_seq FROM actions WHERE id = ?2) ORDER BY created_seq LIMIT 10").unwrap();
-        let rows2 = stmt2.query_map(rusqlite::params!["s-pag", ids.last().unwrap()], |r| r.get::<_,String>(0)).unwrap();
+        let rows2 = stmt2
+            .query_map(rusqlite::params!["s-pag", ids.last().unwrap()], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
         let ids2: Vec<String> = rows2.map(|r| r.unwrap()).collect();
-        assert!(ids2.len() >= 1);
+        assert!(!ids2.is_empty());
     }
 
     #[test]
@@ -197,13 +236,28 @@ mod tests {
         let path = tmp.path();
         let mut conn = crate::db::init_db(path).expect("init db");
         create_session(&conn, "s-sec", "Active", None).unwrap();
-        let a = Action { id: "asec".to_string(), session_id: "s-sec".to_string(), parent_id: None, kind: "k".to_string(), meta: None, state: "Created".to_string(), created_at: 1 };
+        let a = Action {
+            id: "asec".to_string(),
+            session_id: "s-sec".to_string(),
+            parent_id: None,
+            kind: "k".to_string(),
+            meta: None,
+            state: "Created".to_string(),
+            created_at: 1,
+        };
         create_action(&conn, &a).unwrap();
         let exec_id = start_execution(&conn, "asec").unwrap();
         // include a bearer token in stdout
         let token = "This has Bearer abcdef12345== inside";
-        let receipt = finish_execution(&mut conn, &exec_id, "Succeeded", Some(token), None).unwrap();
-        let stored: String = conn.query_row("SELECT stdout_preview FROM receipts WHERE id = ?1", rusqlite::params![receipt], |r| r.get(0)).unwrap();
+        let receipt =
+            finish_execution(&mut conn, &exec_id, "Succeeded", Some(token), None).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT stdout_preview FROM receipts WHERE id = ?1",
+                rusqlite::params![receipt],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(!stored.contains("abcdef12345"));
         assert!(stored.contains("[REDACTED]") || stored.contains("REDACTED"));
     }
@@ -215,7 +269,7 @@ mod tests {
         let mut conn = crate::db::init_db(path).expect("init db");
 
         // create session
-        create_session(&conn, "s-123", "Active", Some("{}")) .expect("create session");
+        create_session(&conn, "s-123", "Active", Some("{}")).expect("create session");
 
         let a = Action {
             id: "act-2".to_string(),
@@ -230,8 +284,18 @@ mod tests {
         create_action(&conn, &a).expect("insert action");
 
         // deleting session should cascade to actions
-        conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params!["s-123"]).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM actions WHERE id = ?1", rusqlite::params!["act-2"], |r| r.get(0)).unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params!["s-123"],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE id = ?1",
+                rusqlite::params!["act-2"],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -243,7 +307,15 @@ mod tests {
 
         // prepare session & action
         create_session(&conn, "s-rcv", "Active", None).unwrap();
-        let a = Action { id: "act-r".to_string(), session_id: "s-rcv".to_string(), parent_id: None, kind: "k".to_string(), meta: None, state: "Created".to_string(), created_at: 1 };
+        let a = Action {
+            id: "act-r".to_string(),
+            session_id: "s-rcv".to_string(),
+            parent_id: None,
+            kind: "k".to_string(),
+            meta: None,
+            state: "Created".to_string(),
+            created_at: 1,
+        };
         create_action(&conn, &a).unwrap();
 
         // start execution
@@ -254,7 +326,13 @@ mod tests {
         assert!(changed >= 1);
 
         // check status
-        let status: String = conn.query_row("SELECT status FROM executions WHERE id = ?1", rusqlite::params![exec_id], |r| r.get(0)).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM executions WHERE id = ?1",
+                rusqlite::params![exec_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "Interrupted");
     }
 }

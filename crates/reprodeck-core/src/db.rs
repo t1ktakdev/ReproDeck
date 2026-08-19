@@ -246,10 +246,14 @@ mod tests {
         let path = tmp.path();
         let conn = init_db(path).expect("init db");
         // check foreign_keys pragma
-        let fk: i64 = conn.query_row("PRAGMA foreign_keys;", [], |r| r.get(0)).unwrap();
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(fk, 1);
         // check journal_mode (string)
-        let jm: String = conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0)).unwrap();
+        let jm: String = conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+            .unwrap();
         assert!(jm.eq_ignore_ascii_case("wal"));
     }
 

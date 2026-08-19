@@ -1,7 +1,6 @@
-
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sha2::{Digest, Sha256};
 
 pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
     // compute checksum
@@ -11,16 +10,54 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
 
     // two-level directory by first two chars
     if checksum.len() < 2 {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "checksum too short"));
+        return Err(std::io::Error::other("checksum too short"));
     }
-    let dir = storage_dir.join(&checksum[0..2]);
+
+    // canonicalize storage root
+    let base = storage_dir.canonicalize()?;
+    let prefix = &checksum[0..2];
+    let dir = storage_dir.join(prefix);
+
+    // If an attacker pre-created a symlink at dir, refuse to proceed.
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact storage prefix is a symlink"));
+        }
+    }
+
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!("{}.tmp", &checksum));
+    let tmp = dir.join(format!("{}.tmp", checksum));
     let finalp = dir.join(&checksum);
 
-    // write atomically
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, &finalp)?;
+    // write to tmp
+    match fs::write(&tmp, data) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+
+    // Re-check containment before rename to mitigate TOCTOU where possible
+    let dir_canon = dir.canonicalize()?;
+    if !dir_canon.starts_with(&base) {
+        let _ = fs::remove_file(&tmp);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact dir canonicalization outside storage root"));
+    }
+
+    // atomic rename into final path
+    if let Err(e) = fs::rename(&tmp, &finalp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Verify final path containment
+    let final_canon = finalp.canonicalize()?;
+    if !final_canon.starts_with(&base) {
+        // attempt to remove the file we just created
+        let _ = fs::remove_file(&finalp);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "artifact stored outside storage root"));
+    }
 
     Ok((checksum, finalp))
 }
@@ -69,5 +106,27 @@ mod tests {
         let outside_file = outside.path().join("foo");
         std::fs::write(&outside_file, b"x").unwrap();
         assert!(!path_within_storage(dir.path(), &outside_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_prefix_prevented() {
+        use std::os::unix::fs as unixfs;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let data = b"symlink test";
+        let checksum = hex::encode(Sha256::digest(data));
+        let prefix = &checksum[0..2];
+        let prefix_path = dir.path().join(prefix);
+        // create symlink at prefix pointing outside
+        unixfs::symlink(outside.path(), &prefix_path).unwrap();
+        // ensure symlink exists
+        assert!(prefix_path.exists());
+        // attempt to store artifact -> should error and not write outside file
+        let res = store_artifact(dir.path(), data);
+        assert!(res.is_err());
+        // ensure outside did not receive file named checksum
+        let outside_file = outside.path().join(&checksum);
+        assert!(!outside_file.exists());
     }
 }
