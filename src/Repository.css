@@ -1,0 +1,83 @@
+.repo-button {
+  appearance: none;
+  max-width: 210px;
+  color: #ced6d1;
+  font-size: 11px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.repo-button:disabled {
+  cursor: default;
+  opacity: .7;
+}
+
+.dirty-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 21px;
+  padding: 0 6px;
+  border: 1px solid #654f31;
+  border-radius: 4px;
+  background: #251d12;
+  color: #ddb77d;
+  font: 700 7px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: .08em;
+}
+
+.repo-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #2d3833;
+  background: #101815;
+}
+
+.repo-banner > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.repo-banner > div > span {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  border: 1px solid #335844;
+  border-radius: 6px;
+  background: #102219;
+  color: #8ad1a4;
+}
+
+.repo-banner strong {
+  display: block;
+  color: #c3d0c8;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.repo-banner p {
+  margin: 4px 0 0;
+  color: #748179;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.repo-path-caption {
+  margin: -4px 16px 13px;
+  color: #738078;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.repo-path-caption span {
+  color: #9caaa2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}

@@ -1,91 +1,585 @@
-use std::fs;
+use git2::{Delta, DiffFile, DiffOptions, FileMode, Oid, Repository};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use thiserror::Error;
 use uuid::Uuid;
-
-// test-only failure injection moved to per-Shadow instance; no global Lazy/AtomicI32 needed
 
 #[derive(Debug, Error)]
 pub enum GitShadowError {
     #[error("git failed: {0} -- {1}")]
     GitFailed(String, String),
-
+    #[error("git output was not valid UTF-8 for command: {0}")]
+    GitOutputNotUtf8(String),
+    #[error("git repository error: {0}")]
+    Git2(#[from] git2::Error),
     #[error("repository has no commits (unborn) for path {0}")]
     UnbornRepository(String),
-
     #[error("patch could not be applied cleanly: {0}")]
     PatchApplyFailed(String),
-
     #[error("submodule/gitlink changes are not supported")]
     SubmoduleNotSupported,
-
+    #[error("unsupported Git file type for {0}")]
+    UnsupportedFileType(String),
+    #[error("Git path cannot be represented safely on this platform")]
+    UnsupportedPathEncoding,
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
+    Io(#[from] io::Error),
+    #[error(
+        "apply failed and rollback also failed; apply={apply_error}; rollback={rollback_error}"
+    )]
+    RollbackFailed {
+        apply_error: String,
+        rollback_error: String,
+    },
     #[error("apply succeeded but cleanup failed; pending cleanup marker at {0}")]
     AppliedCleanupPending(PathBuf),
 }
 
 type Result<T> = std::result::Result<T, GitShadowError>;
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
         .current_dir(cwd)
         .args(args)
         .output()
         .map_err(GitShadowError::Io)?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        // detect unborn repository when asking rev-parse HEAD
-        if args == ["rev-parse", "HEAD"] {
-            return Err(GitShadowError::UnbornRepository(stderr));
-        }
-        Err(GitShadowError::GitFailed(args.join(" "), stderr))
-    }
-}
-
-#[allow(dead_code)]
-fn run_git_with_input(cwd: &Path, args: &[&str], input: &str) -> Result<String> {
-    let mut cmd = Command::new("git");
-    let mut child = cmd
-        .current_dir(cwd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(GitShadowError::Io)?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(GitShadowError::Io)?;
-    }
-    let out = child.wait_with_output().map_err(GitShadowError::Io)?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    if output.status.success() {
+        Ok(output.stdout)
     } else {
         Err(GitShadowError::GitFailed(
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).to_string(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         ))
     }
 }
 
-fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
+fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
+    let bytes = run_git_bytes(cwd, args)?;
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|_| GitShadowError::GitOutputNotUtf8(args.join(" ")))
+}
+
+fn run_worktree_add(repo: &Path, branch: &str, worktree: &Path, base: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .arg("worktree")
+        .arg("add")
+        .arg("-b")
+        .arg(branch)
+        .arg(worktree)
+        .arg(base)
         .output()
         .map_err(GitShadowError::Io)?;
-    if out.status.success() {
-        Ok(out.stdout)
+    if output.status.success() {
+        Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        Err(GitShadowError::GitFailed(args.join(" "), stderr))
+        Err(GitShadowError::GitFailed(
+            "worktree add".to_string(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn git_path(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(windows)]
+fn git_path(bytes: &[u8]) -> Result<PathBuf> {
+    let value = std::str::from_utf8(bytes).map_err(|_| GitShadowError::UnsupportedPathEncoding)?;
+    Ok(PathBuf::from(value))
+}
+
+fn diff_path(file: DiffFile<'_>) -> Result<PathBuf> {
+    file.path_bytes()
+        .ok_or(GitShadowError::UnsupportedPathEncoding)
+        .and_then(git_path)
+}
+
+fn mode_is_executable(mode: FileMode, path: &Path) -> Result<bool> {
+    match mode {
+        FileMode::BlobExecutable => Ok(true),
+        FileMode::Blob | FileMode::BlobGroupWritable => Ok(false),
+        FileMode::Commit => Err(GitShadowError::SubmoduleNotSupported),
+        FileMode::Link | FileMode::Tree | FileMode::Unreadable => {
+            Err(GitShadowError::UnsupportedFileType(format!("{:?}", path)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DesiredState {
+    Missing,
+    File { data: Vec<u8>, executable: bool },
+}
+
+#[derive(Debug, Clone)]
+struct Mutation {
+    path: PathBuf,
+    expected: DesiredState,
+    desired: DesiredState,
+}
+
+fn file_state_from_diff(
+    repo: &Repository,
+    file: DiffFile<'_>,
+    path: &Path,
+) -> Result<DesiredState> {
+    let executable = mode_is_executable(file.mode(), path)?;
+    let blob = repo.find_blob(file.id())?;
+    Ok(DesiredState::File {
+        data: blob.content().to_vec(),
+        executable,
+    })
+}
+
+fn insert_mutation(mutations: &mut BTreeMap<PathBuf, Mutation>, mutation: Mutation) -> Result<()> {
+    if mutations.contains_key(&mutation.path) {
+        return Err(GitShadowError::PatchApplyFailed(format!(
+            "ambiguous multiple changes for {:?}",
+            mutation.path
+        )));
+    }
+    mutations.insert(mutation.path.clone(), mutation);
+    Ok(())
+}
+
+fn build_mutations(repo: &Repository, base: Oid, target: Oid) -> Result<Vec<Mutation>> {
+    let base_tree = repo.find_commit(base)?.tree()?;
+    let target_tree = repo.find_commit(target)?.tree()?;
+    let mut options = DiffOptions::new();
+    options.include_typechange(true);
+    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut options))?;
+    let mut mutations = BTreeMap::<PathBuf, Mutation>::new();
+
+    for delta in diff.deltas() {
+        match delta.status() {
+            Delta::Added => {
+                let new_file = delta.new_file();
+                let path = diff_path(new_file)?;
+                let desired = file_state_from_diff(repo, new_file, &path)?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path,
+                        expected: DesiredState::Missing,
+                        desired,
+                    },
+                )?;
+            }
+            Delta::Deleted => {
+                let old_file = delta.old_file();
+                let path = diff_path(old_file)?;
+                let expected = file_state_from_diff(repo, old_file, &path)?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path,
+                        expected,
+                        desired: DesiredState::Missing,
+                    },
+                )?;
+            }
+            Delta::Modified => {
+                let old_file = delta.old_file();
+                let new_file = delta.new_file();
+                let old_path = diff_path(old_file)?;
+                let new_path = diff_path(new_file)?;
+                if old_path != new_path {
+                    return Err(GitShadowError::PatchApplyFailed(format!(
+                        "unexpected path change in modified delta: {:?} -> {:?}",
+                        old_path, new_path
+                    )));
+                }
+                let expected = file_state_from_diff(repo, old_file, &old_path)?;
+                let desired = file_state_from_diff(repo, new_file, &new_path)?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path: new_path,
+                        expected,
+                        desired,
+                    },
+                )?;
+            }
+            Delta::Renamed => {
+                let old_file = delta.old_file();
+                let new_file = delta.new_file();
+                let old_path = diff_path(old_file)?;
+                let new_path = diff_path(new_file)?;
+                let expected = file_state_from_diff(repo, old_file, &old_path)?;
+                let desired = file_state_from_diff(repo, new_file, &new_path)?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path: old_path,
+                        expected,
+                        desired: DesiredState::Missing,
+                    },
+                )?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path: new_path,
+                        expected: DesiredState::Missing,
+                        desired,
+                    },
+                )?;
+            }
+            Delta::Copied => {
+                let new_file = delta.new_file();
+                let path = diff_path(new_file)?;
+                let desired = file_state_from_diff(repo, new_file, &path)?;
+                insert_mutation(
+                    &mut mutations,
+                    Mutation {
+                        path,
+                        expected: DesiredState::Missing,
+                        desired,
+                    },
+                )?;
+            }
+            Delta::Typechange => {
+                return Err(GitShadowError::UnsupportedFileType(format!(
+                    "type change {:?} -> {:?}",
+                    delta.old_file().path_bytes(),
+                    delta.new_file().path_bytes()
+                )));
+            }
+            Delta::Unmodified => {}
+            Delta::Ignored | Delta::Untracked | Delta::Unreadable | Delta::Conflicted => {
+                return Err(GitShadowError::PatchApplyFailed(format!(
+                    "unsupported diff status {:?}",
+                    delta.status()
+                )));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut folded = BTreeSet::new();
+        for path in mutations.keys() {
+            let value = path
+                .to_str()
+                .ok_or(GitShadowError::UnsupportedPathEncoding)?
+                .replace('\\', "/")
+                .to_lowercase();
+            if !folded.insert(value) {
+                return Err(GitShadowError::PatchApplyFailed(
+                    "case-only or case-colliding path change is not safe on Windows".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(mutations.into_values().collect())
+}
+
+fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn ensure_path_within_repo(repo: &Path, relative: &Path) -> Result<()> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(GitShadowError::PatchApplyFailed(format!(
+            "unsafe path {:?}",
+            relative
+        )));
+    }
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(GitShadowError::PatchApplyFailed(format!(
+                "unsafe path component in {:?}",
+                relative
+            )));
+        }
+    }
+
+    let repo_root = repo.canonicalize()?;
+    let mut current = repo_root.clone();
+    for component in relative.components() {
+        if let Component::Normal(name) = component {
+            current.push(name);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if is_symlink_or_reparse(&metadata) {
+                        return Err(GitShadowError::PatchApplyFailed(format!(
+                            "symlink or reparse point is not allowed in apply path {:?}",
+                            relative
+                        )));
+                    }
+                    let canonical = current.canonicalize()?;
+                    if !canonical.starts_with(&repo_root) {
+                        return Err(GitShadowError::PatchApplyFailed(format!(
+                            "path escapes repository: {:?}",
+                            relative
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotState {
+    Missing,
+    File {
+        data: Vec<u8>,
+        permissions: Permissions,
+        executable: bool,
+    },
+}
+
+fn snapshot_path(repo: &Path, relative: &Path) -> Result<SnapshotState> {
+    ensure_path_within_repo(repo, relative)?;
+    let absolute = repo.join(relative);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SnapshotState::Missing),
+        Err(error) => return Err(error.into()),
+    };
+    if is_symlink_or_reparse(&metadata) || !metadata.file_type().is_file() {
+        return Err(GitShadowError::PatchApplyFailed(format!(
+            "apply target is not a regular file: {:?}",
+            relative
+        )));
+    }
+    Ok(SnapshotState::File {
+        data: fs::read(&absolute)?,
+        permissions: metadata.permissions(),
+        executable: executable(&metadata),
+    })
+}
+
+fn snapshot_matches_expected(snapshot: &SnapshotState, expected: &DesiredState) -> bool {
+    match (snapshot, expected) {
+        (SnapshotState::Missing, DesiredState::Missing) => true,
+        (
+            SnapshotState::File {
+                data, executable, ..
+            },
+            DesiredState::File {
+                data: expected_data,
+                executable: expected_executable,
+            },
+        ) => {
+            if data != expected_data {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                executable == expected_executable
+            }
+            #[cfg(windows)]
+            {
+                let _ = expected_executable;
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+fn collect_missing_parent_dirs(repo: &Path, relative: &Path, output: &mut BTreeSet<PathBuf>) {
+    let Some(parent) = relative.parent() else {
+        return;
+    };
+    let mut current = repo.to_path_buf();
+    for component in parent.components() {
+        if let Component::Normal(name) = component {
+            current.push(name);
+            if !current.exists() {
+                output.insert(current.clone());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn desired_permissions(snapshot: &SnapshotState, executable: bool) -> Option<Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = match snapshot {
+        SnapshotState::File { permissions, .. } => permissions.clone(),
+        SnapshotState::Missing => Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+    };
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    });
+    Some(permissions)
+}
+
+#[cfg(windows)]
+fn desired_permissions(snapshot: &SnapshotState, _executable: bool) -> Option<Permissions> {
+    match snapshot {
+        SnapshotState::File { permissions, .. } => Some(permissions.clone()),
+        SnapshotState::Missing => None,
+    }
+}
+
+#[cfg(windows)]
+fn make_removable(path: &Path) -> io::Result<()> {
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn make_removable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn atomic_write(path: &Path, data: &[u8], permissions: Option<Permissions>) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("file path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".reprodeck-write-{}.tmp", Uuid::new_v4()));
+
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temp, permissions)?;
+        }
+
+        #[cfg(windows)]
+        if path.exists() {
+            make_removable(path)?;
+            fs::remove_file(path)?;
+        }
+
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn apply_mutation(repo: &Path, mutation: &Mutation, snapshot: &SnapshotState) -> Result<()> {
+    ensure_path_within_repo(repo, &mutation.path)?;
+    let absolute = repo.join(&mutation.path);
+    match &mutation.desired {
+        DesiredState::Missing => {
+            if absolute.exists() {
+                make_removable(&absolute)?;
+                fs::remove_file(&absolute)?;
+            }
+        }
+        DesiredState::File { data, executable } => {
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            ensure_path_within_repo(repo, &mutation.path)?;
+            atomic_write(&absolute, data, desired_permissions(snapshot, *executable))?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_snapshot(repo: &Path, relative: &Path, snapshot: &SnapshotState) -> io::Result<()> {
+    let absolute = repo.join(relative);
+    match snapshot {
+        SnapshotState::Missing => match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                make_removable(&absolute)?;
+                fs::remove_file(&absolute)
+            }
+            Ok(_) => Err(io::Error::other("rollback target became a non-file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+        SnapshotState::File {
+            data, permissions, ..
+        } => atomic_write(&absolute, data, Some(permissions.clone())),
+    }
+}
+
+fn rollback(
+    repo: &Path,
+    snapshots: &[(PathBuf, SnapshotState)],
+    created_dirs: &BTreeSet<PathBuf>,
+) -> io::Result<()> {
+    let mut first_error: Option<io::Error> = None;
+    for (path, snapshot) in snapshots.iter().rev() {
+        if let Err(error) = restore_snapshot(repo, path, snapshot) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    let mut dirs: Vec<&PathBuf> = created_dirs.iter().collect();
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        match fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -98,52 +592,47 @@ pub struct Shadow {
     pub original_head: String,
     pub original_branch: String,
     #[cfg(test)]
-    pub apply_fail_after: std::sync::atomic::AtomicI32,
+    apply_fail_after: std::sync::atomic::AtomicI32,
 }
 
 impl Shadow {
-    /// Create a new shadow worktree based on `base_commit` (or HEAD if None).
-    /// The shadow is implemented using `git worktree add -b <branch> <path> <commit>`.
     pub fn create(repo: &Path, base_commit: Option<&str>) -> Result<Self> {
-        // Resolve repository root
-        let repo_root = PathBuf::from(run_git(repo, &["rev-parse", "--show-toplevel"])?);
-
-        // ensure repository has an initial commit
-        if run_git(&repo_root, &["rev-parse", "--verify", "HEAD"]).is_err() {
-            return Err(GitShadowError::UnbornRepository(repo.display().to_string()));
-        }
-        let original_branch = run_git(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-        let original_head = run_git(&repo_root, &["rev-parse", "HEAD"])?;
-
-        let base = match base_commit {
-            Some(b) => b.to_string(),
-            None => original_head.clone(),
+        let discovered = Repository::discover(repo)?;
+        let repo_root = discovered
+            .workdir()
+            .ok_or_else(|| {
+                GitShadowError::PatchApplyFailed("bare repositories are not supported".to_string())
+            })?
+            .canonicalize()?;
+        let head = discovered
+            .head()
+            .map_err(|_| GitShadowError::UnbornRepository(repo.display().to_string()))?;
+        let original_oid = head
+            .target()
+            .ok_or_else(|| GitShadowError::UnbornRepository(repo.display().to_string()))?;
+        let original_head = original_oid.to_string();
+        let original_branch = head.shorthand().unwrap_or("HEAD").to_string();
+        let base_oid = match base_commit {
+            Some(revision) => discovered.revparse_single(revision)?.peel_to_commit()?.id(),
+            None => original_oid,
         };
+        drop(head);
+        drop(discovered);
 
-        // create a temporary directory for the worktree
-        let tmp_dir = std::env::temp_dir().join(format!("reprodeck-shadow-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp_dir)?;
-
+        let worktree = std::env::temp_dir().join(format!("reprodeck-shadow-{}", Uuid::new_v4()));
+        fs::create_dir_all(&worktree)?;
         let branch = format!("reprodeck-shadow-{}", Uuid::new_v4());
+        if let Err(error) = run_worktree_add(&repo_root, &branch, &worktree, &base_oid.to_string())
+        {
+            let _ = fs::remove_dir_all(&worktree);
+            return Err(error);
+        }
 
-        // git worktree add -b <branch> <tmp_dir> <base>
-        run_git(
-            &repo_root,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                tmp_dir.to_str().unwrap(),
-                &base,
-            ],
-        )?;
-
-        Ok(Shadow {
+        Ok(Self {
             repo: repo_root,
-            worktree: tmp_dir,
+            worktree,
             branch,
-            base_commit: base,
+            base_commit: base_oid.to_string(),
             original_head,
             original_branch,
             #[cfg(test)]
@@ -151,11 +640,9 @@ impl Shadow {
         })
     }
 
-    /// Commit all changes in the shadow worktree with given message
     pub fn commit_all(&self, message: &str) -> Result<String> {
         run_git(&self.worktree, &["add", "-A"])?;
         run_git(&self.worktree, &["commit", "-m", message])?;
-        // return new head of shadow branch
         run_git(
             &self.repo,
             &["rev-parse", &format!("refs/heads/{}", self.branch)],
@@ -163,14 +650,14 @@ impl Shadow {
     }
 
     #[cfg(test)]
-    pub fn set_apply_fail_after(&self, v: i32) {
+    pub fn set_apply_fail_after(&self, value: i32) {
         self.apply_fail_after
-            .store(v, std::sync::atomic::Ordering::SeqCst);
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Get name-status diff between original head and shadow branch
+    /// Human/display form. Apply itself never parses this string; machine path
+    /// handling uses libgit2 byte paths instead.
     pub fn diff_name_status(&self) -> Result<String> {
-        // machine-parsable name-status (NUL-delimited)
         run_git(
             &self.repo,
             &[
@@ -182,7 +669,6 @@ impl Shadow {
         )
     }
 
-    /// Prepare the patch (git diff --binary base..branch)
     pub fn prepare_patch(&self) -> Result<String> {
         let patch = run_git(
             &self.repo,
@@ -192,706 +678,130 @@ impl Shadow {
                 &format!("{}..{}", self.base_commit, self.branch),
             ],
         )?;
-
-        if patch.contains("new mode 160000")
-            || patch.contains("old mode 160000")
-            || patch.contains("GITLINK")
-        {
+        if patch.contains("new mode 160000") || patch.contains("old mode 160000") {
             return Err(GitShadowError::SubmoduleNotSupported);
         }
-
         Ok(patch)
     }
 
-    /// Apply the shadow patch into the original working tree WITHOUT committing.
-    /// This will:
-    /// - verify the repo still exists and HEAD didn't move since creation
-    /// - perform a dry-run check that the patch can be applied cleanly
-    /// - apply the patch to the working tree (no commit, no index changes)
-    ///
-    /// If the patch cannot be applied cleanly, returns an error and does not
-    /// mutate the original working tree.
+    /// Apply the shadow commit to the original working tree without touching the
+    /// Git index or creating a commit. All affected paths are preflighted and
+    /// snapshotted before the first mutation; every apply error goes through the
+    /// same rollback path.
     pub fn apply(self) -> Result<()> {
-        // ensure original repo still exists
         if !self.repo.exists() {
-            return Err(GitShadowError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
                 "original repository no longer exists",
-            )));
-        }
-
-        // ensure original hasn't moved
-        let current_head = run_git(&self.repo, &["rev-parse", "HEAD"])?;
-        if current_head != self.original_head {
-            return Err(GitShadowError::GitFailed(
-                "HEAD moved".into(),
-                "original HEAD changed since shadow creation".into(),
-            ));
-        }
-
-        // Snapshot index (staged entries) so we can restore it after apply.
-        // We capture `git ls-files -s` output (mode sha stage\tpath) and convert it to
-        // the format expected by `git update-index --index-info` (mode sha\tpath).
-        let index_snapshot_bytes = run_git_bytes(&self.repo, &["ls-files", "-s"]).ok();
-        let mut index_info_input: Option<String> = None;
-        let mut index_snapshot_raw: Option<String> = None;
-        if let Some(b) = index_snapshot_bytes {
-            let s = String::from_utf8_lossy(&b).to_string();
-            index_snapshot_raw = Some(s.clone());
-            let mut lines = Vec::new();
-            for line in s.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(tabpos) = line.find('\t') {
-                    let left = &line[..tabpos];
-                    let path = &line[tabpos + 1..];
-                    let mut parts = left.split_whitespace();
-                    let mode = parts.next().unwrap_or("");
-                    let sha = parts.next().unwrap_or("");
-                    lines.push(format!("{} {}\t{}", mode, sha, path));
-                }
-            }
-            if !lines.is_empty() {
-                index_info_input = Some(lines.join("\n") + "\n");
-            }
-        }
-
-        // enumerate name-status to understand operations in a machine-safe way (-z output)
-        let name_status_z = run_git(
-            &self.repo,
-            &[
-                "diff",
-                "-z",
-                "--name-status",
-                &format!("{}..{}", self.base_commit, self.branch),
-            ],
-        )?;
-
-        #[derive(Debug, Clone)]
-        enum Change {
-            Add(PathBuf),
-            Modify(PathBuf),
-            Delete(PathBuf),
-            Rename(PathBuf, PathBuf),
-        }
-
-        let mut changes: Vec<Change> = Vec::new();
-        // parse NUL-delimited tokens: status\0path\0  or status\0old\0new\0 for renames
-        let mut parts: Vec<&str> = name_status_z.split('\u{0}').collect();
-        // last element after trailing NUL may be empty; remove it
-        if let Some(last) = parts.last() {
-            if last.is_empty() {
-                parts.pop();
-            }
-        }
-        let mut i = 0usize;
-        while i < parts.len() {
-            let status = parts[i];
-            i += 1;
-            match status.chars().next() {
-                Some('A') => {
-                    if i < parts.len() {
-                        changes.push(Change::Add(PathBuf::from(parts[i])));
-                    }
-                    i += 1;
-                }
-                Some('M') => {
-                    if i < parts.len() {
-                        changes.push(Change::Modify(PathBuf::from(parts[i])));
-                    }
-                    i += 1;
-                }
-                Some('D') => {
-                    if i < parts.len() {
-                        changes.push(Change::Delete(PathBuf::from(parts[i])));
-                    }
-                    i += 1;
-                }
-                Some('R') => {
-                    // rename uses two paths
-                    if i + 1 < parts.len() {
-                        let old = PathBuf::from(parts[i]);
-                        let new = PathBuf::from(parts[i + 1]);
-                        changes.push(Change::Rename(old, new));
-                    }
-                    i += 2;
-                }
-                _ => {
-                    // unknown status; skip one token to avoid infinite loop
-                    i += 1;
-                }
-            }
-        }
-
-        // prepare conflict detection: for every changed path, compare working tree content to base_commit content
-        for ch in &changes {
-            match ch {
-                Change::Add(p) | Change::Modify(p) | Change::Delete(p) => {
-                    let base_blob = run_git_bytes(
-                        &self.repo,
-                        &["show", &format!("{}:{}", self.base_commit, p.display())],
-                    )
-                    .ok();
-                    let work_bytes = std::fs::read(self.repo.join(p)).ok();
-                    // If working tree differs from base, and shadow modifies it, that's a conflict
-                    if let (Some(b), Some(w)) = (base_blob.as_ref(), work_bytes.as_ref()) {
-                        if b != w {
-                            return Err(GitShadowError::PatchApplyFailed(format!(
-                                "conflict on {}",
-                                p.display()
-                            )));
-                        }
-                    }
-                    if base_blob.is_none() && work_bytes.is_some() && matches!(ch, Change::Add(_)) {
-                        // file exists locally but wasn't in base; treat as conflict
-                        return Err(GitShadowError::PatchApplyFailed(format!(
-                            "conflict on {} (local addition)",
-                            p.display()
-                        )));
-                    }
-                }
-                Change::Rename(old, _new) => {
-                    let base_blob = run_git_bytes(
-                        &self.repo,
-                        &["show", &format!("{}:{}", self.base_commit, old.display())],
-                    )
-                    .ok();
-                    let work_bytes = std::fs::read(self.repo.join(old)).ok();
-                    if let (Some(b), Some(w)) = (base_blob.as_ref(), work_bytes.as_ref()) {
-                        if b != w {
-                            return Err(GitShadowError::PatchApplyFailed(format!(
-                                "conflict on {} for rename",
-                                old.display()
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build an ApplyPlan: prefetch blobs and metadata for atomic-like apply
-        #[derive(Debug, Clone)]
-        enum Op {
-            Write {
-                path: PathBuf,
-                blob: Vec<u8>,
-                executable: bool,
-            },
-            Delete {
-                path: PathBuf,
-            },
-        }
-
-        let mut plan: Vec<Op> = Vec::new();
-        for ch in &changes {
-            match ch {
-                Change::Add(p) | Change::Modify(p) => {
-                    ensure_path_within_repo(&self.repo, p)?;
-                    let blob = run_git_bytes(
-                        &self.repo,
-                        &["show", &format!("{}:{}", self.branch, p.display())],
-                    )?;
-                    let mut executable = false;
-                    if let Ok(ls) =
-                        run_git(&self.repo, &["ls-tree", &self.branch, &p.to_string_lossy()])
-                    {
-                        if ls.starts_with("100755") {
-                            executable = true;
-                        }
-                        if ls.starts_with("160000") {
-                            return Err(GitShadowError::SubmoduleNotSupported);
-                        }
-                    }
-                    plan.push(Op::Write {
-                        path: p.clone(),
-                        blob,
-                        executable,
-                    });
-                }
-                Change::Delete(p) => {
-                    ensure_path_within_repo(&self.repo, p)?;
-                    plan.push(Op::Delete { path: p.clone() });
-                }
-                Change::Rename(old, new) => {
-                    if cfg!(windows)
-                        && old.to_string_lossy().to_lowercase()
-                            == new.to_string_lossy().to_lowercase()
-                        && old != new
-                    {
-                        return Err(GitShadowError::PatchApplyFailed(format!(
-                            "case-only rename unsupported on Windows: {} -> {}",
-                            old.display(),
-                            new.display()
-                        )));
-                    }
-                    ensure_path_within_repo(&self.repo, old)?;
-                    ensure_path_within_repo(&self.repo, new)?;
-                    // fetch blob for new path from shadow branch
-                    let blob = run_git_bytes(
-                        &self.repo,
-                        &["show", &format!("{}:{}", self.branch, new.display())],
-                    )?;
-                    let mut executable = false;
-                    if let Ok(ls) = run_git(
-                        &self.repo,
-                        &["ls-tree", &self.branch, &new.to_string_lossy()],
-                    ) {
-                        if ls.starts_with("100755") {
-                            executable = true;
-                        }
-                        if ls.starts_with("160000") {
-                            return Err(GitShadowError::SubmoduleNotSupported);
-                        }
-                    }
-                    plan.push(Op::Write {
-                        path: new.clone(),
-                        blob,
-                        executable,
-                    });
-                    plan.push(Op::Delete { path: old.clone() });
-                }
-            }
-        }
-
-        // Validate plan against working tree (conflicts)
-        for op in &plan {
-            match op {
-                Op::Write { path, .. } => {
-                    let base_blob = run_git_bytes(
-                        &self.repo,
-                        &["show", &format!("{}:{}", self.base_commit, path.display())],
-                    )
-                    .ok();
-                    let work_bytes = std::fs::read(self.repo.join(path)).ok();
-                    if let (Some(b), Some(w)) = (base_blob.as_ref(), work_bytes.as_ref()) {
-                        if b != w {
-                            return Err(GitShadowError::PatchApplyFailed(format!(
-                                "conflict on {}",
-                                path.display()
-                            )));
-                        }
-                    }
-                    if base_blob.is_none() && work_bytes.is_some() {
-                        return Err(GitShadowError::PatchApplyFailed(format!(
-                            "conflict on {} (local addition)",
-                            path.display()
-                        )));
-                    }
-                }
-                Op::Delete { path } => {
-                    let target = self.repo.join(path);
-                    if target.exists() && target.is_dir() {
-                        return Err(GitShadowError::PatchApplyFailed(format!(
-                            "delete would remove directory: {}",
-                            path.display()
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Prepare rollback journal (backups) in tempdir
-        let journal_dir = std::env::temp_dir().join(format!("reprodeck-apply-{}", Uuid::new_v4()));
-        fs::create_dir_all(&journal_dir)?;
-        let mut backups: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-        let mut applied_ops: Vec<Op> = Vec::new();
-
-        for (idx, op) in plan.into_iter().enumerate() {
-            // backup pre-existing file if any
-            match &op {
-                Op::Write { path, .. } => {
-                    let target = self.repo.join(path);
-                    if target.exists() {
-                        if target.is_file() {
-                            let bp = journal_dir.join(format!("backup-{}", idx));
-                            fs::copy(&target, &bp)?;
-                            backups.push((path.clone(), Some(bp)));
-                        } else {
-                            return Err(GitShadowError::PatchApplyFailed(format!(
-                                "unexpected non-file at {}",
-                                path.display()
-                            )));
-                        }
-                    } else {
-                        backups.push((path.clone(), None));
-                    }
-                }
-                Op::Delete { path } => {
-                    let target = self.repo.join(path);
-                    if target.exists() {
-                        if target.is_file() {
-                            let bp = journal_dir.join(format!("backup-{}", idx));
-                            fs::copy(&target, &bp)?;
-                            backups.push((path.clone(), Some(bp)));
-                        } else {
-                            return Err(GitShadowError::PatchApplyFailed(format!(
-                                "refuse to remove non-file {}",
-                                path.display()
-                            )));
-                        }
-                    } else {
-                        backups.push((path.clone(), None));
-                    }
-                }
-            }
-
-            // test injection (per-Shadow, test-only)
-            #[cfg(test)]
-            {
-                let v = self
-                    .apply_fail_after
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                if v >= 0 && (idx as i32) == v {
-                    // simulate failure: rollback from backups
-                    for (p, b) in backups.iter().rev() {
-                        let targ = self.repo.join(p);
-                        if let Some(bp) = b {
-                            let _ = fs::copy(bp, &targ);
-                        } else {
-                            let _ = fs::remove_file(&targ);
-                        }
-                    }
-                    let _ = fs::remove_dir_all(&journal_dir);
-                    return Err(GitShadowError::PatchApplyFailed(
-                        "injected failure".to_string(),
-                    ));
-                }
-            }
-
-            // apply op
-            match &op {
-                Op::Write {
-                    path,
-                    blob,
-                    executable,
-                } => {
-                    let target = self.repo.join(path);
-                    if let Some(parent) = target.parent() {
-                        // parent_rel is the relative path within the repo for validation
-                        if let Some(parent_rel) = path.parent() {
-                            // ensure parent exists and still within repo before mutation
-                            ensure_path_within_repo(&self.repo, parent_rel)?;
-                        }
-                        fs::create_dir_all(parent)?;
-                        // double-check parent is still within repo after creation
-                        if let Some(parent_rel) = path.parent() {
-                            ensure_path_within_repo(&self.repo, parent_rel)?;
-                        }
-                    }
-
-                    // Platform-specific safe write:
-                    // - On Unix: use openat with O_NOFOLLOW to avoid symlink races
-                    // - On other platforms: perform an additional ensure_path_within_repo check and then write
-                    #[cfg(unix)]
-                    {
-                        use libc::{
-                            close, fchmod, mode_t, openat, write as libc_write, O_CREAT,
-                            O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_WRONLY,
-                        };
-                        use std::ffi::CString;
-                        use std::os::unix::ffi::OsStrExt;
-
-                        let parent = target.parent().expect("parent exists");
-                        // open parent dir FD with O_DIRECTORY|O_RDONLY|O_NOFOLLOW
-                        let parent_c = CString::new(parent.as_os_str().as_bytes()).unwrap();
-                        let dirfd = unsafe {
-                            libc::open(parent_c.as_ptr(), libc::O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                        };
-                        if dirfd < 0 {
-                            return Err(GitShadowError::Io(std::io::Error::last_os_error()));
-                        }
-
-                        let name = target.file_name().unwrap().to_string_lossy();
-                        let name_c = CString::new(name.as_bytes()).unwrap();
-
-                        let fd = unsafe {
-                            openat(
-                                dirfd,
-                                name_c.as_ptr(),
-                                O_CREAT | O_EXCL | O_WRONLY,
-                                0o644 as mode_t,
-                            )
-                        };
-                        if fd < 0 {
-                            unsafe { close(dirfd) };
-                            return Err(GitShadowError::Io(std::io::Error::last_os_error()));
-                        }
-
-                        // write blob fully
-                        let mut written = 0usize;
-                        while written < blob.len() {
-                            let res = unsafe {
-                                libc_write(
-                                    fd,
-                                    blob[written..].as_ptr() as *const _,
-                                    blob.len() - written,
-                                )
-                            };
-                            if res < 0 {
-                                unsafe {
-                                    close(fd);
-                                    close(dirfd)
-                                };
-                                return Err(GitShadowError::Io(std::io::Error::last_os_error()));
-                            }
-                            written += res as usize;
-                        }
-
-                        if *executable {
-                            let r = unsafe { fchmod(fd, 0o755 as mode_t) };
-                            if r != 0 {
-                                unsafe {
-                                    close(fd);
-                                    close(dirfd)
-                                };
-                                return Err(GitShadowError::Io(std::io::Error::last_os_error()));
-                            }
-                        }
-
-                        unsafe {
-                            close(fd);
-                            close(dirfd)
-                        };
-                    }
-
-                    #[cfg(not(unix))]
-                    {
-                        // conservative fallback: re-check path and then write
-                        ensure_path_within_repo(&self.repo, path)?;
-                        fs::write(&target, blob)?;
-                        if *executable {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mut perm = fs::metadata(&target)?.permissions();
-                                perm.set_mode(0o755);
-                                fs::set_permissions(&target, perm)?;
-                            }
-                        }
-                    }
-                }
-                Op::Delete { path } => {
-                    let target = self.repo.join(path);
-                    // validate before delete (path is relative)
-                    ensure_path_within_repo(&self.repo, path)?;
-                    if target.exists() {
-                        fs::remove_file(&target)?;
-                    }
-                }
-            }
-
-            applied_ops.push(op);
-        }
-
-        // applied successfully; cleanup journal
-        let _ = fs::remove_dir_all(&journal_dir);
-
-        // verify HEAD unchanged
-        let after_head = run_git(&self.repo, &["rev-parse", "HEAD"])?;
-        if after_head != self.original_head {
-            return Err(GitShadowError::GitFailed(
-                "HEAD changed".into(),
-                "unexpected HEAD change after apply".into(),
-            ));
-        }
-
-        // restore index snapshot (if any) so pre-existing staged entries are preserved
-        if let Some(input) = index_info_input {
-            // update-index --index-info reads lines of: "<mode> <sha>\t<path>"
-            let _ = run_git_with_input(&self.repo, &["update-index", "--index-info"], &input)
-                .map_err(|e| GitShadowError::GitFailed("update-index".into(), format!("{}", e)))?;
-            // verify index matches snapshot by comparing ls-files -s
-            if let Ok(after) = run_git(&self.repo, &["ls-files", "-s"]) {
-                let before_raw = index_snapshot_raw.unwrap_or_default();
-                if before_raw.trim_end() != after.trim_end() {
-                    return Err(GitShadowError::GitFailed(
-                        "index_restore_mismatch".into(),
-                        format!(
-                            "index mismatch after restore\nbefore:\n{}\nafter:\n{}",
-                            before_raw, after
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // attempt cleanup; if cleanup fails, record pending marker and return AppliedCleanupPending
-        if let Err(_e) = self.discard() {
-            // record recovery state in ReproDeck-managed storage (not in user repo)
-            let id = crate::recovery::create_pending(
-                &self.repo,
-                &self.base_commit,
-                &self.worktree,
-                &self.branch,
             )
-            .map_err(|e| {
-                GitShadowError::Io(std::io::Error::other(format!(
-                    "recovery store failed: {}",
-                    e
-                )))
-            })?;
-            return Err(GitShadowError::AppliedCleanupPending(
-                std::path::PathBuf::from(id),
+            .into());
+        }
+        let repo = Repository::open(&self.repo)?;
+        let current_head = repo
+            .head()?
+            .target()
+            .ok_or_else(|| GitShadowError::UnbornRepository(self.repo.display().to_string()))?;
+        if current_head.to_string() != self.original_head {
+            return Err(GitShadowError::GitFailed(
+                "HEAD moved".to_string(),
+                "original HEAD changed since shadow creation".to_string(),
             ));
         }
+        let base = Oid::from_str(&self.base_commit)?;
+        let target = repo.refname_to_id(&format!("refs/heads/{}", self.branch))?;
+        let mutations = build_mutations(&repo, base, target)?;
+        drop(repo);
 
+        let mut snapshots = Vec::with_capacity(mutations.len());
+        let mut created_dirs = BTreeSet::new();
+        for mutation in &mutations {
+            ensure_path_within_repo(&self.repo, &mutation.path)?;
+            let snapshot = snapshot_path(&self.repo, &mutation.path)?;
+            if !snapshot_matches_expected(&snapshot, &mutation.expected) {
+                return Err(GitShadowError::PatchApplyFailed(format!(
+                    "working tree changed since shadow base at {:?}",
+                    mutation.path
+                )));
+            }
+            collect_missing_parent_dirs(&self.repo, &mutation.path, &mut created_dirs);
+            snapshots.push((mutation.path.clone(), snapshot));
+        }
+
+        let apply_result = (|| -> Result<()> {
+            for (index, mutation) in mutations.iter().enumerate() {
+                #[cfg(test)]
+                if self
+                    .apply_fail_after
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == index as i32
+                {
+                    return Err(io::Error::other("injected apply IO failure").into());
+                }
+                apply_mutation(&self.repo, mutation, &snapshots[index].1)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(apply_error) = apply_result {
+            if let Err(rollback_error) = rollback(&self.repo, &snapshots, &created_dirs) {
+                return Err(GitShadowError::RollbackFailed {
+                    apply_error: apply_error.to_string(),
+                    rollback_error: rollback_error.to_string(),
+                });
+            }
+            return Err(apply_error);
+        }
+
+        if let Err(cleanup_error) = self.discard() {
+            let marker =
+                std::env::temp_dir().join(format!("reprodeck-recovery-{}.txt", Uuid::new_v4()));
+            let message = format!(
+                "apply succeeded; cleanup pending\nrepo={:?}\nworktree={:?}\nbranch={}\nerror={}\n",
+                self.repo, self.worktree, self.branch, cleanup_error
+            );
+            fs::write(&marker, message)?;
+            return Err(GitShadowError::AppliedCleanupPending(marker));
+        }
         Ok(())
     }
 
-    /// Discard shadow (remove worktree and delete branch). If force is true,
-    /// force removal of worktree.
     pub fn discard(&self) -> Result<()> {
-        // remove worktree
-        let wt = self.worktree.to_str().ok_or_else(|| {
-            GitShadowError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid worktree path",
-            ))
-        })?;
-        // Inspect `git worktree list` and remove any worktree entries that reference this branch
-        if let Ok(list) = run_git(&self.repo, &["worktree", "list"]) {
-            for line in list.lines() {
-                // line format: <path> <HEAD> [branch]
-                if line.contains(&format!("[{}]", self.branch)) || line.contains(wt) {
-                    if let Some(path_tok) = line.split_whitespace().next() {
-                        let _ = run_git(&self.repo, &["worktree", "remove", path_tok, "--force"]);
-                    }
-                }
+        if self.worktree.exists() {
+            let output = Command::new("git")
+                .current_dir(&self.repo)
+                .arg("worktree")
+                .arg("remove")
+                .arg("--force")
+                .arg(&self.worktree)
+                .output()?;
+            if !output.status.success() && self.worktree.exists() {
+                return Err(GitShadowError::GitFailed(
+                    "worktree remove --force".to_string(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
             }
         }
 
-        // Delete branch only if it exists
-        if run_git(
-            &self.repo,
-            &[
-                "show-ref",
-                "--verify",
-                &format!("refs/heads/{}", self.branch),
-            ],
-        )
-        .is_ok()
-        {
-            // attempt to delete branch; if it fails because some worktree still references it, try to remove referencing entries and retry once
-            if let Err(_e) = run_git(&self.repo, &["branch", "-D", &self.branch]) {
-                // try removing any worktree entries that reference this branch and retry
-                if let Ok(list) = run_git(&self.repo, &["worktree", "list"]) {
-                    for line in list.lines() {
-                        if line.contains(&format!("[{}]", self.branch)) {
-                            if let Some(path_tok) = line.split_whitespace().next() {
-                                let _ = run_git(
-                                    &self.repo,
-                                    &["worktree", "remove", path_tok, "--force"],
-                                );
-                            }
-                        }
-                    }
-                }
-                // retry delete
-                run_git(&self.repo, &["branch", "-D", &self.branch])?;
-            }
-        }
+        let _ = Command::new("git")
+            .current_dir(&self.repo)
+            .args(["worktree", "prune"])
+            .status();
 
-        // remove filesystem dir if still exists
+        let reference = format!("refs/heads/{}", self.branch);
+        let branch_exists = Command::new("git")
+            .current_dir(&self.repo)
+            .args(["show-ref", "--verify", "--quiet", &reference])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if branch_exists {
+            run_git(&self.repo, &["branch", "-D", &self.branch])?;
+        }
         if self.worktree.exists() {
             fs::remove_dir_all(&self.worktree)?;
         }
         Ok(())
     }
-}
-
-/// Snapshot the working tree content (byte-for-byte) for comparison.
-#[cfg(test)]
-fn snapshot_working_tree(repo: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(repo)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            // skip .git and .reprodeck metadata directory
-            let p = e.path();
-            if p.is_dir() && (p.ends_with(".git") || p.ends_with(".reprodeck")) {
-                return false;
-            }
-            true
-        })
-    {
-        let p = entry.path();
-        if p.is_file() {
-            let rel = p.strip_prefix(repo).unwrap().to_path_buf();
-            let data = std::fs::read(p)?;
-            out.push((rel, data));
-        }
-    }
-    // sort for deterministic order
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
-/// Ensure that a user-provided path (from git diff) is safe to operate on inside `repo`.
-fn ensure_path_within_repo(repo: &Path, rel: &Path) -> Result<()> {
-    // Reject absolute paths
-    if rel.is_absolute() {
-        return Err(GitShadowError::PatchApplyFailed(format!(
-            "absolute path not allowed: {}",
-            rel.display()
-        )));
-    }
-
-    // Reject parent traversal
-    for comp in rel.components() {
-        if matches!(comp, Component::ParentDir) {
-            return Err(GitShadowError::PatchApplyFailed(format!(
-                "parent traversal not allowed: {}",
-                rel.display()
-            )));
-        }
-    }
-
-    let repo_canon = repo.canonicalize().map_err(GitShadowError::Io)?;
-
-    // find nearest existing ancestor of repo.join(rel)
-    let target = repo.join(rel);
-    let mut anc = target.clone();
-    while !anc.exists() {
-        if !anc.pop() {
-            break;
-        }
-    }
-    let anc_canon = anc.canonicalize().map_err(GitShadowError::Io)?;
-    if !anc_canon.starts_with(&repo_canon) {
-        return Err(GitShadowError::PatchApplyFailed(format!(
-            "path escapes repo: {}",
-            rel.display()
-        )));
-    }
-
-    // Walk each component from repo root to the nearest ancestor and ensure no symlink points outside
-    let mut p = repo.to_path_buf();
-    for comp in rel.components() {
-        p.push(comp.as_os_str());
-        if p.exists() {
-            let md = p.symlink_metadata().map_err(GitShadowError::Io)?;
-            if md.file_type().is_symlink() {
-                // resolve symlink target
-                let link = fs::read_link(&p).map_err(GitShadowError::Io)?;
-                let abs = if link.is_absolute() {
-                    link
-                } else {
-                    p.parent().unwrap().join(link)
-                };
-                let abs_canon = abs.canonicalize().map_err(GitShadowError::Io)?;
-                if !abs_canon.starts_with(&repo_canon) {
-                    return Err(GitShadowError::PatchApplyFailed(format!(
-                        "symlink escapes repo at {}",
-                        p.display()
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -900,456 +810,252 @@ mod tests {
     use std::fs::{read_to_string, write};
     use tempfile::tempdir;
 
-    fn init_repo_with_file(dir: &Path, filename: &str, content: &str) -> Result<()> {
-        run_git(dir, &["init"])?;
-        // ensure local commit identity so tests don't depend on global git config
-        run_git(dir, &["config", "user.name", "Tester"])?;
-        run_git(dir, &["config", "user.email", "tester@example.com"])?;
-        write(dir.join(filename), content)?;
-        run_git(dir, &["add", filename])?;
-        run_git(dir, &["commit", "-m", "initial"])?;
-        Ok(())
+    fn init_repo_with_file(repo: &Path, name: &str, content: &str) {
+        run_git(repo, &["init"]).unwrap();
+        run_git(repo, &["config", "user.email", "tests@reprodeck.local"]).unwrap();
+        run_git(repo, &["config", "user.name", "ReproDeck Tests"]).unwrap();
+        write(repo.join(name), content).unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "initial"]).unwrap();
     }
 
     #[test]
-    fn shadow_does_not_modify_original_until_apply() {
+    fn original_untouched_until_apply() {
         let td = tempdir().unwrap();
         let repo = td.path();
-
-        init_repo_with_file(repo, "foo.txt", "base").unwrap();
-
+        init_repo_with_file(repo, "a.txt", "one");
         let shadow = Shadow::create(repo, None).unwrap();
-
-        // modify file in shadow worktree
-        let shadow_file = shadow.worktree.join("foo.txt");
-        write(&shadow_file, "modified in shadow").unwrap();
-        // commit in shadow
-        shadow.commit_all("shadow change").unwrap();
-
-        // ensure original file remains unchanged
-        let orig = read_to_string(repo.join("foo.txt")).unwrap();
-        assert_eq!(orig, "base");
-
-        // check diff reports change (machine-safe NUL-delimited output)
-        let diff = shadow.diff_name_status().unwrap();
-        let parts: Vec<&str> = diff.split('\u{0}').filter(|s| !s.is_empty()).collect();
-        let mut found = false;
-        let mut i = 0usize;
-        while i + 1 < parts.len() {
-            let status = parts[i];
-            let path = parts[i + 1];
-            if status.starts_with('M') && path == "foo.txt" {
-                found = true;
-                break;
-            }
-            i += 2;
-        }
-        assert!(found, "expected modified foo.txt in diff");
-
-        // ensure original file remains unchanged until apply
-        let new_orig = read_to_string(repo.join("foo.txt")).unwrap();
-        assert_eq!(new_orig, "base");
-
-        // apply shadow (no commit)
+        write(shadow.worktree.join("a.txt"), "two").unwrap();
+        shadow.commit_all("shadow").unwrap();
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "one");
         shadow.apply().unwrap();
-
-        // now original file should be updated in working tree
-        let new_orig = read_to_string(repo.join("foo.txt")).unwrap();
-        assert_eq!(new_orig, "modified in shadow");
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "two");
     }
 
     #[test]
-    fn apply_detects_conflict_when_original_changed() {
+    fn apply_does_not_move_head_or_commit() {
         let td = tempdir().unwrap();
         let repo = td.path();
-
-        init_repo_with_file(repo, "bar.txt", "base").unwrap();
-
+        init_repo_with_file(repo, "a.txt", "one");
+        let before = run_git(repo, &["rev-parse", "HEAD"]).unwrap();
         let shadow = Shadow::create(repo, None).unwrap();
-
-        // modify file in shadow
-        let shadow_file = shadow.worktree.join("bar.txt");
-        write(&shadow_file, "changed in shadow").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // now change original and commit
-        write(repo.join("bar.txt"), "changed in original").unwrap();
-        run_git(repo, &["add", "bar.txt"]).unwrap();
-        run_git(
-            repo,
-            &[
-                "commit",
-                "-m",
-                "orig change",
-                "--author=Orig <o@example.com>",
-            ],
-        )
-        .unwrap();
-
-        // applying shadow should fail due to original HEAD mismatch
-        let res = shadow.apply();
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn original_unchanged_before_apply() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-
-        init_repo_with_file(repo, "a.txt", "hello").unwrap();
-        let shadow = Shadow::create(repo, None).unwrap();
-
-        let shadow_file = shadow.worktree.join("a.txt");
-        write(&shadow_file, "shadowed").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // original must still have original content until apply
-        let orig = read_to_string(repo.join("a.txt")).unwrap();
-        assert_eq!(orig, "hello");
-    }
-
-    #[test]
-    fn apply_updates_worktree_without_commit() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-
-        init_repo_with_file(repo, "b.txt", "one").unwrap();
-        let before_head = run_git(repo, &["rev-parse", "HEAD"]).unwrap();
-
-        let shadow = Shadow::create(repo, None).unwrap();
-        let shadow_file = shadow.worktree.join("b.txt");
-        write(&shadow_file, "two").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // apply
+        write(shadow.worktree.join("a.txt"), "two").unwrap();
+        shadow.commit_all("shadow").unwrap();
         shadow.apply().unwrap();
-
-        // working tree updated
-        let content = read_to_string(repo.join("b.txt")).unwrap();
-        assert_eq!(content, "two");
-
-        // HEAD unchanged
-        let after_head = run_git(repo, &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(before_head, after_head);
+        assert_eq!(run_git(repo, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "two");
     }
 
     #[test]
-    fn apply_refuses_when_conflicting_user_change_exists() {
+    fn apply_rejects_moved_head() {
         let td = tempdir().unwrap();
         let repo = td.path();
-
-        init_repo_with_file(repo, "c.txt", "base").unwrap();
+        init_repo_with_file(repo, "a.txt", "one");
         let shadow = Shadow::create(repo, None).unwrap();
-
-        // modify in shadow and commit
-        let shadow_file = shadow.worktree.join("c.txt");
-        write(&shadow_file, "shadow").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // create conflicting dirty change in original (not committed)
-        write(repo.join("c.txt"), "local-dirty").unwrap();
-
-        let res = shadow.apply();
-        assert!(res.is_err());
-
-        // original working tree content preserved
-        let orig = read_to_string(repo.join("c.txt")).unwrap();
-        assert_eq!(orig, "local-dirty");
+        write(shadow.worktree.join("a.txt"), "shadow").unwrap();
+        shadow.commit_all("shadow").unwrap();
+        write(repo.join("b.txt"), "new").unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "move head"]).unwrap();
+        assert!(shadow.apply().is_err());
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "one");
     }
 
     #[test]
-    fn apply_preserves_unrelated_dirty_user_changes() {
+    fn dirty_conflicting_change_is_rejected() {
         let td = tempdir().unwrap();
         let repo = td.path();
-
-        init_repo_with_file(repo, "d.txt", "base").unwrap();
-        write(repo.join("unrelated.txt"), "me").unwrap();
-
+        init_repo_with_file(repo, "a.txt", "one");
         let shadow = Shadow::create(repo, None).unwrap();
-        let shadow_file = shadow.worktree.join("d.txt");
-        write(&shadow_file, "shadowed").unwrap();
-        shadow.commit_all("shadow change").unwrap();
+        write(shadow.worktree.join("a.txt"), "shadow").unwrap();
+        shadow.commit_all("shadow").unwrap();
+        write(repo.join("a.txt"), "local").unwrap();
+        assert!(shadow.apply().is_err());
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "local");
+    }
 
-        // unrelated file is dirty locally
-        write(repo.join("unrelated.txt"), "me-mod").unwrap();
-
+    #[test]
+    fn unrelated_dirty_change_is_preserved() {
+        let td = tempdir().unwrap();
+        let repo = td.path();
+        init_repo_with_file(repo, "a.txt", "one");
+        write(repo.join("b.txt"), "base").unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "b"]).unwrap();
+        let shadow = Shadow::create(repo, None).unwrap();
+        write(shadow.worktree.join("a.txt"), "shadow").unwrap();
+        shadow.commit_all("shadow").unwrap();
+        write(repo.join("b.txt"), "local dirty").unwrap();
         shadow.apply().unwrap();
-
-        // unrelated preserved
-        let u = read_to_string(repo.join("unrelated.txt")).unwrap();
-        assert_eq!(u, "me-mod");
-
-        // applied change present
-        let d = read_to_string(repo.join("d.txt")).unwrap();
-        assert_eq!(d, "shadowed");
+        assert_eq!(read_to_string(repo.join("a.txt")).unwrap(), "shadow");
+        assert_eq!(read_to_string(repo.join("b.txt")).unwrap(), "local dirty");
     }
 
     #[test]
-    fn apply_preserves_preexisting_staged_index() {
+    fn staged_index_is_preserved() {
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "a.txt", "one").unwrap();
+        init_repo_with_file(repo, "a.txt", "one");
+        write(repo.join("staged.txt"), "base").unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "staged base"]).unwrap();
+        let shadow = Shadow::create(repo, None).unwrap();
+        write(shadow.worktree.join("a.txt"), "shadow").unwrap();
+        shadow.commit_all("shadow").unwrap();
 
-        // create and stage an unrelated file in the original repo
-        std::fs::write(repo.join("staged.txt"), "staged").unwrap();
+        write(repo.join("staged.txt"), "staged change").unwrap();
         run_git(repo, &["add", "staged.txt"]).unwrap();
-        let before_index = run_git(repo, &["ls-files", "-s"]).unwrap();
-
-        let shadow = Shadow::create(repo, None).unwrap();
-        // make a change in shadow and commit
-        let shadow_file = shadow.worktree.join("a.txt");
-        write(&shadow_file, "two").unwrap();
-        run_git(&shadow.worktree, &["add", "a.txt"]).unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // apply shadow
+        let before = run_git_bytes(repo, &["ls-files", "-s"]).unwrap();
         shadow.apply().unwrap();
-
-        // index must be preserved exactly
-        let after_index = run_git(repo, &["ls-files", "-s"]).unwrap();
-        assert_eq!(before_index, after_index);
+        let after = run_git_bytes(repo, &["ls-files", "-s"]).unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
-    fn discard_never_changes_original() {
+    fn supports_add_delete_and_rename_as_final_tree_changes() {
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "e.txt", "base").unwrap();
+        init_repo_with_file(repo, "a.txt", "one");
+        write(repo.join("b.txt"), "two").unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "b"]).unwrap();
         let shadow = Shadow::create(repo, None).unwrap();
-
-        // modify in shadow and commit
-        let shadow_file = shadow.worktree.join("e.txt");
-        write(&shadow_file, "shadow").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // discard shadow resources
-        shadow.discard().unwrap();
-
-        // original untouched
-        let orig = read_to_string(repo.join("e.txt")).unwrap();
-        assert_eq!(orig, "base");
+        run_git(&shadow.worktree, &["mv", "a.txt", "a2.txt"]).unwrap();
+        fs::remove_file(shadow.worktree.join("b.txt")).unwrap();
+        write(shadow.worktree.join("c.txt"), "three").unwrap();
+        shadow.commit_all("tree changes").unwrap();
+        shadow.apply().unwrap();
+        assert!(!repo.join("a.txt").exists());
+        assert_eq!(read_to_string(repo.join("a2.txt")).unwrap(), "one");
+        assert!(!repo.join("b.txt").exists());
+        assert_eq!(read_to_string(repo.join("c.txt")).unwrap(), "three");
     }
 
     #[test]
-    fn cleanup_is_idempotent() {
+    fn supports_binary_modification() {
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "f.txt", "base").unwrap();
+        init_repo_with_file(repo, "bin.dat", "base");
         let shadow = Shadow::create(repo, None).unwrap();
-
-        // discard twice
-        shadow.discard().unwrap();
-        shadow.discard().unwrap();
-
-        // repo unchanged
-        let orig = read_to_string(repo.join("f.txt")).unwrap();
-        assert_eq!(orig, "base");
+        let binary = vec![0, 1, 2, 3, 255, 0, 42];
+        fs::write(shadow.worktree.join("bin.dat"), &binary).unwrap();
+        shadow.commit_all("binary").unwrap();
+        shadow.apply().unwrap();
+        assert_eq!(fs::read(repo.join("bin.dat")).unwrap(), binary);
     }
 
     #[test]
-    fn path_traversal_rejected() {
+    fn generic_apply_error_rolls_back_all_previous_mutations() {
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "h.txt", "x").unwrap();
-
-        let bad = Path::new("../evil.txt");
-        assert!(ensure_path_within_repo(repo, bad).is_err());
-    }
-
-    #[test]
-    fn absolute_path_rejected() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        init_repo_with_file(repo, "i.txt", "x").unwrap();
-        let bad = if cfg!(windows) {
-            Path::new("C:\\Windows\\system.ini")
-        } else {
-            Path::new("/etc/passwd")
-        };
-        assert!(ensure_path_within_repo(repo, bad).is_err());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn symlink_escape_rejected() {
-        use std::os::unix::fs::symlink;
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        init_repo_with_file(repo, "j.txt", "x").unwrap();
-
-        let outside = td.path().join("outside.txt");
-        std::fs::write(&outside, "secret").unwrap();
-
-        let link = repo.join("link_out");
-        symlink(&outside, &link).unwrap();
-
-        let rel = Path::new("link_out");
-        let res = ensure_path_within_repo(repo, rel);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn rename_over_existing_conflict_rejected() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        init_repo_with_file(repo, "k1.txt", "one").unwrap();
-        init_repo_with_file(repo, "k2.txt", "two").unwrap();
-
+        init_repo_with_file(repo, "f1.txt", "one");
+        write(repo.join("f2.txt"), "two").unwrap();
+        write(repo.join("f3.txt"), "three").unwrap();
+        run_git(repo, &["add", "-A"]).unwrap();
+        run_git(repo, &["commit", "-m", "files"]).unwrap();
         let shadow = Shadow::create(repo, None).unwrap();
-        // in shadow, remove existing k2 and rename k1 -> k2
-        run_git(&shadow.worktree, &["rm", "k2.txt"]).unwrap();
-        run_git(&shadow.worktree, &["mv", "k1.txt", "k2.txt"]).unwrap();
-        shadow.commit_all("shadow rename to k2").unwrap();
-
-        // create conflicting dirty change in original (not committed)
-        write(repo.join("k2.txt"), "local-mod").unwrap();
-
-        // applying should fail because target exists and is locally modified
-        let res = shadow.apply();
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn mid_apply_failure_rolls_back_all_previous_file_changes() {
-        // Ordering not needed here
-        // prepare repo
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        init_repo_with_file(repo, "f1.txt", "one").unwrap();
-        init_repo_with_file(repo, "f2.txt", "two").unwrap();
-        init_repo_with_file(repo, "f3.txt", "three").unwrap();
-
-        let shadow = Shadow::create(repo, None).unwrap();
-        // modify files in shadow
         write(shadow.worktree.join("f1.txt"), "ONE").unwrap();
         write(shadow.worktree.join("f2.txt"), "TWO").unwrap();
         write(shadow.worktree.join("f3.txt"), "THREE").unwrap();
-        run_git(&shadow.worktree, &["add", "f1.txt", "f2.txt", "f3.txt"]).unwrap();
-        shadow.commit_all("shadow changes").unwrap();
-
-        // set failure after first apply op (index 1)
+        shadow.commit_all("changes").unwrap();
         shadow.set_apply_fail_after(1);
+        assert!(shadow.apply().is_err());
+        assert_eq!(read_to_string(repo.join("f1.txt")).unwrap(), "one");
+        assert_eq!(read_to_string(repo.join("f2.txt")).unwrap(), "two");
+        assert_eq!(read_to_string(repo.join("f3.txt")).unwrap(), "three");
+    }
 
-        let orig1 = std::fs::read_to_string(repo.join("f1.txt")).unwrap();
-        let orig2 = std::fs::read_to_string(repo.join("f2.txt")).unwrap();
-        let orig3 = std::fs::read_to_string(repo.join("f3.txt")).unwrap();
-
-        let res = shadow.apply();
-        assert!(res.is_err());
-
-        // ensure original restored
-        let now1 = std::fs::read_to_string(repo.join("f1.txt")).unwrap();
-        let now2 = std::fs::read_to_string(repo.join("f2.txt")).unwrap();
-        let now3 = std::fs::read_to_string(repo.join("f3.txt")).unwrap();
-        assert_eq!(orig1, now1);
-        assert_eq!(orig2, now2);
-        assert_eq!(orig3, now3);
-
-        // No global reset necessary; the failure injection was per-Shadow and the shadow was consumed.
+    #[test]
+    fn discard_is_idempotent() {
+        let td = tempdir().unwrap();
+        let repo = td.path();
+        init_repo_with_file(repo, "a.txt", "one");
+        let shadow = Shadow::create(repo, None).unwrap();
+        shadow.discard().unwrap();
+        shadow.discard().unwrap();
+        assert!(!shadow.worktree.exists());
     }
 
     #[test]
     fn unborn_repository_is_rejected_cleanly() {
         let td = tempdir().unwrap();
-        let repo = td.path();
-        // init repository but do not commit
-        run_git(repo, &["init"]).unwrap();
-        // attempt to create shadow should yield UnbornRepository
-        let res = Shadow::create(repo, None);
-        assert!(matches!(res, Err(GitShadowError::UnbornRepository(_))));
+        run_git(td.path(), &["init"]).unwrap();
+        assert!(matches!(
+            Shadow::create(td.path(), None),
+            Err(GitShadowError::UnbornRepository(_))
+        ));
     }
 
     #[test]
-    fn failed_apply_leaves_original_unchanged() {
+    fn path_traversal_is_rejected() {
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "g.txt", "orig").unwrap();
-
-        let shadow = Shadow::create(repo, None).unwrap();
-        let shadow_file = shadow.worktree.join("g.txt");
-        write(&shadow_file, "shadow").unwrap();
-        shadow.commit_all("shadow change").unwrap();
-
-        // create conflicting dirty change in original (not committed)
-        write(repo.join("g.txt"), "local-dirty").unwrap();
-
-        let before = snapshot_working_tree(repo).unwrap();
-        let res = shadow.apply();
-        assert!(res.is_err());
-        let after = snapshot_working_tree(repo).unwrap();
-        assert_eq!(
-            before, after,
-            "working tree must be byte-for-byte identical after failed apply"
-        );
+        init_repo_with_file(repo, "a.txt", "one");
+        assert!(ensure_path_within_repo(repo, Path::new("../outside")).is_err());
+        assert!(ensure_path_within_repo(repo, Path::new("./a.txt")).is_err());
     }
 
-    #[test]
-    fn apply_supports_new_deleted_and_renamed_files() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        // initial files
-        init_repo_with_file(repo, "a.txt", "one").unwrap();
-        write(repo.join("b.txt"), "two").unwrap();
-        run_git(repo, &["add", "b.txt"]).unwrap();
-        run_git(repo, &["commit", "-m", "add b"]).unwrap();
-
-        let shadow = Shadow::create(repo, None).unwrap();
-        // rename a.txt -> a2.txt
-        run_git(&shadow.worktree, &["mv", "a.txt", "a2.txt"]).unwrap();
-        // delete b.txt
-        run_git(&shadow.worktree, &["rm", "b.txt"]).unwrap();
-        // new file c.txt
-        write(shadow.worktree.join("c.txt"), "three").unwrap();
-        run_git(&shadow.worktree, &["add", "c.txt"]).unwrap();
-        shadow.commit_all("shadow changes").unwrap();
-
-        shadow.apply().unwrap();
-
-        // checks
-        assert!(repo.join("a2.txt").exists());
-        assert!(!repo.join("b.txt").exists());
-        let c = read_to_string(repo.join("c.txt")).unwrap();
-        assert_eq!(c, "three");
-    }
-
-    #[test]
-    fn apply_supports_binary_file_changes() {
-        let td = tempdir().unwrap();
-        let repo = td.path();
-        init_repo_with_file(repo, "bin.dat", "").unwrap();
-        // write binary data in shadow
-        let shadow = Shadow::create(repo, None).unwrap();
-        let bin = vec![0u8, 1, 2, 3, 4, 255u8];
-        std::fs::write(shadow.worktree.join("bin.dat"), &bin).unwrap();
-        run_git(&shadow.worktree, &["add", "bin.dat"]).unwrap();
-        shadow.commit_all("binary").unwrap();
-
-        shadow.apply().unwrap();
-
-        let got = std::fs::read(repo.join("bin.dat")).unwrap();
-        assert_eq!(got, bin);
-    }
-
-    #[test]
     #[cfg(unix)]
-    fn file_mode_executable_bit_behavior() {
+    #[test]
+    fn symlink_component_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let td = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo = td.path();
+        init_repo_with_file(repo, "a.txt", "one");
+        symlink(outside.path(), repo.join("escape")).unwrap();
+        assert!(ensure_path_within_repo(repo, Path::new("escape/file.txt")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modifying_existing_file_works_on_unix() {
+        let td = tempdir().unwrap();
+        let repo = td.path();
+        init_repo_with_file(repo, "existing.txt", "old");
+        let shadow = Shadow::create(repo, None).unwrap();
+        write(shadow.worktree.join("existing.txt"), "new").unwrap();
+        shadow.commit_all("modify").unwrap();
+        shadow.apply().unwrap();
+        assert_eq!(read_to_string(repo.join("existing.txt")).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_git_path_is_applied_without_lossy_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+        let td = tempdir().unwrap();
+        let repo = td.path();
+        init_repo_with_file(repo, "base.txt", "base");
+        let shadow = Shadow::create(repo, None).unwrap();
+        let name = OsString::from_vec(b"nonutf8-\xff.txt".to_vec());
+        fs::write(shadow.worktree.join(&name), b"bytes").unwrap();
+        shadow.commit_all("non utf8").unwrap();
+        shadow.apply().unwrap();
+        assert_eq!(fs::read(repo.join(name)).unwrap(), b"bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bit_is_applied() {
         use std::os::unix::fs::PermissionsExt;
         let td = tempdir().unwrap();
         let repo = td.path();
-        init_repo_with_file(repo, "ex.sh", "echo hi").unwrap();
+        init_repo_with_file(repo, "run.sh", "echo hi\n");
         let shadow = Shadow::create(repo, None).unwrap();
-        let p = shadow.worktree.join("ex.sh");
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&p, perm).unwrap();
-        run_git(&shadow.worktree, &["add", "ex.sh"]).unwrap();
-        shadow.commit_all("make exec").unwrap();
-
+        let path = shadow.worktree.join("run.sh");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        shadow.commit_all("executable").unwrap();
         shadow.apply().unwrap();
-        let meta = std::fs::metadata(repo.join("ex.sh")).unwrap();
-        assert!(
-            meta.permissions().mode() & 0o111 != 0,
-            "executable bit should be set on unix"
+        assert_ne!(
+            fs::metadata(repo.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
         );
     }
 }

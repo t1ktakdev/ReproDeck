@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "reprodeck",
+  "productName": "ReproDeck",
   "version": "0.1.0",
-  "identifier": "com.user.reprodeck",
+  "identifier": "com.reprodeck.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "reprodeck",
-        "width": 800,
-        "height": 600
+        "title": "ReproDeck",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1000,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true
       }
     ],
     "security": {
