@@ -14,7 +14,43 @@ type Action = {
   id: string;
   kind: string;
   state: string;
+  meta: string | null;
   created_at: number;
+};
+
+type Execution = {
+  id: string;
+  action_id: string;
+  status: string;
+  started_at: number;
+  finished_at: number | null;
+  duration_ms: number | null;
+};
+
+type Receipt = {
+  id: string;
+  execution_id: string;
+  summary: string | null;
+  stdout_preview: string | null;
+  stderr_preview: string | null;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  created_at: number;
+};
+
+type Artifact = {
+  id: string;
+  receipt_id: string;
+  checksum: string;
+  size: number;
+  media_type: string | null;
+};
+
+type TimelineEntry = {
+  action: Action;
+  execution: Execution | null;
+  receipt: Receipt | null;
+  artifacts: Artifact[];
 };
 
 type Contract = {
@@ -48,7 +84,18 @@ type BridgeError = {
   message?: string;
 };
 
+type ActionMeta = {
+  phase?: string;
+  expected_exit_code?: number;
+  command?: {
+    executable?: string;
+    args?: string[];
+    cwd?: string | null;
+  };
+};
+
 type WorkspaceView = "Timeline" | "Verification";
+type InspectorTab = "Details" | "Output" | "Evidence";
 
 const formatTime = (seconds: number) =>
   new Intl.DateTimeFormat(undefined, {
@@ -63,6 +110,18 @@ const formatRelative = (seconds: number) => {
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
   if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
   return `${Math.floor(delta / 86400)}d ago`;
+};
+
+const formatDuration = (durationMs: number | null) => {
+  if (durationMs === null) return "—";
+  if (durationMs < 1000) return `${durationMs} ms`;
+  return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 2 : 1)} s`;
+};
+
+const formatBytes = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
 const humanize = (value: string) =>
@@ -88,6 +147,34 @@ function statusTone(value: string) {
   return "neutral";
 }
 
+function parseActionMeta(meta: string | null): ActionMeta | null {
+  if (!meta) return null;
+  try {
+    const parsed: unknown = JSON.parse(meta);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as ActionMeta;
+  } catch {
+    return null;
+  }
+}
+
+function commandLabel(meta: ActionMeta | null) {
+  const executable = meta?.command?.executable?.trim();
+  if (!executable) return null;
+  const args = Array.isArray(meta?.command?.args) ? meta.command.args.filter((arg) => typeof arg === "string") : [];
+  return [executable, ...args].join(" ");
+}
+
+function entryStatus(entry: TimelineEntry) {
+  return entry.execution?.status ?? entry.action.state;
+}
+
+function entryTitle(entry: TimelineEntry) {
+  const meta = parseActionMeta(entry.action.meta);
+  if (meta?.phase) return `${humanize(meta.phase)} · ${humanize(entry.action.kind)}`;
+  return humanize(entry.action.kind);
+}
+
 function Mark({ tone = "neutral" }: { tone?: string }) {
   return <span className={`mark mark-${tone}`} aria-hidden="true" />;
 }
@@ -95,12 +182,13 @@ function Mark({ tone = "neutral" }: { tone?: string }) {
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [actions, setActions] = useState<Action[]>([]);
+  const [timelineEntries, setTimelineEntries] = useState<TimelineEntry[]>([]);
   const [contracts, setContracts] = useState<Contract[]>([]);
   const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
   const [selectedContractId, setSelectedContractId] = useState<string | null>(null);
   const [summary, setSummary] = useState<OutcomeSummary | null>(null);
   const [view, setView] = useState<WorkspaceView>("Timeline");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("Details");
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -109,8 +197,10 @@ function App() {
   const [creating, setCreating] = useState(false);
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
-  const selectedAction = actions.find((action) => action.id === selectedActionId) ?? null;
+  const selectedEntry = timelineEntries.find((entry) => entry.action.id === selectedActionId) ?? null;
   const selectedContract = contracts.find((contract) => contract.id === selectedContractId) ?? null;
+  const selectedMeta = selectedEntry ? parseActionMeta(selectedEntry.action.meta) : null;
+  const selectedCommand = commandLabel(selectedMeta);
 
   const filteredSessions = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -118,24 +208,25 @@ function App() {
     return sessions.filter((session) => session.id.toLowerCase().includes(query) || session.state.toLowerCase().includes(query));
   }, [search, sessions]);
 
-  const timeline = useMemo(() => [...actions].reverse(), [actions]);
+  const timeline = useMemo(() => [...timelineEntries].reverse(), [timelineEntries]);
 
   async function loadSession(id: string) {
     setSelectedSessionId(id);
     setSelectedActionId(null);
     setSelectedContractId(null);
     setSummary(null);
+    setInspectorTab("Details");
     setError(null);
     try {
-      const [nextActions, nextContracts] = await Promise.all([
-        invoke<Action[]>("list_actions", { sessionId: id }),
+      const [nextTimeline, nextContracts] = await Promise.all([
+        invoke<TimelineEntry[]>("list_timeline_entries", { sessionId: id }),
         invoke<Contract[]>("list_contracts", { sessionId: id }),
       ]);
-      setActions(nextActions ?? []);
+      setTimelineEntries(nextTimeline ?? []);
       setContracts(nextContracts ?? []);
     } catch (nextError) {
       setError(bridgeMessage(nextError));
-      setActions([]);
+      setTimelineEntries([]);
       setContracts([]);
     }
   }
@@ -183,9 +274,14 @@ function App() {
     }
   }
 
+  function selectTimelineEntry(actionId: string) {
+    setSelectedActionId(actionId);
+    setInspectorTab("Details");
+  }
+
   useEffect(() => {
     void refreshSessions();
-    // The initial bridge read is intentionally one-shot. Subsequent refreshes are explicit.
+    // Initial bridge load is intentionally one-shot; later refreshes are explicit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -218,7 +314,7 @@ function App() {
             <p className="section-label">Workspace</p>
             <button><span className="nav-icon">◇</span>Repository</button>
             <button><span className="nav-icon">◉</span>Sessions <em>{sessions.length}</em></button>
-            <button className={view === "Timeline" ? "active" : ""} onClick={() => setView("Timeline")}><span className="nav-icon">◷</span>Timeline <em>{actions.length || ""}</em></button>
+            <button className={view === "Timeline" ? "active" : ""} onClick={() => setView("Timeline")}><span className="nav-icon">◷</span>Timeline <em>{timelineEntries.length || ""}</em></button>
             <button className={view === "Verification" ? "active" : ""} onClick={() => setView("Verification")}><span className="nav-icon">✓</span>Verification <em>{contracts.length || ""}</em></button>
             <button disabled><span className="nav-icon">↔</span>Changes <small>next</small></button>
             <button disabled><span className="nav-icon">▤</span>Evidence <small>next</small></button>
@@ -279,15 +375,18 @@ function App() {
                     <div className="panel-empty"><strong>No timeline events yet</strong><p>Actions created by reproduction and verification flows will appear here automatically.</p></div>
                   ) : (
                     <div className="timeline-list">
-                      {timeline.map((action) => {
-                        const tone = statusTone(action.state);
+                      {timeline.map((entry) => {
+                        const status = entryStatus(entry);
+                        const tone = statusTone(status);
+                        const meta = parseActionMeta(entry.action.meta);
+                        const command = commandLabel(meta);
                         return (
-                          <button key={action.id} className={selectedActionId === action.id ? "timeline-row selected" : "timeline-row"} onClick={() => setSelectedActionId(action.id)}>
-                            <time>{formatTime(action.created_at)}</time>
+                          <button key={entry.action.id} className={selectedActionId === entry.action.id ? "timeline-row selected" : "timeline-row"} onClick={() => selectTimelineEntry(entry.action.id)}>
+                            <time>{formatTime(entry.action.created_at)}</time>
                             <span className="timeline-node"><Mark tone={tone} /></span>
                             <div className="timeline-copy">
-                              <div><strong>{humanize(action.kind)}</strong><span className={`mini-pill tone-${tone}`}>{action.state}</span></div>
-                              <p>{action.id}</p>
+                              <div><strong>{entryTitle(entry)}</strong><span className={`mini-pill tone-${tone}`}>{status}</span></div>
+                              <p>{command ?? entry.receipt?.summary ?? entry.action.id}</p>
                             </div>
                           </button>
                         );
@@ -336,19 +435,61 @@ function App() {
         </main>
 
         <aside className="inspector">
-          <div className="inspector-heading"><span>Selected item</span><strong>{view === "Timeline" ? "Timeline details" : "Verification details"}</strong></div>
+          <div className="inspector-heading"><span>Selected item</span><strong>{view === "Timeline" ? "Receipt & evidence" : "Verification details"}</strong></div>
           {view === "Timeline" ? (
-            selectedAction ? (
-              <div className="inspector-body">
-                <span className={`large-status tone-${statusTone(selectedAction.state)}`}>{selectedAction.state}</span>
-                <dl>
-                  <div><dt>Type</dt><dd>{humanize(selectedAction.kind)}</dd></div>
-                  <div><dt>Action ID</dt><dd className="mono breakable">{selectedAction.id}</dd></div>
-                  <div><dt>Captured</dt><dd>{new Date(selectedAction.created_at * 1000).toLocaleString()}</dd></div>
-                </dl>
-                <div className="inspector-note"><strong>Receipt inspector is next.</strong><p>The core already persists executions, receipts and evidence. The next bridge slice will expose those relationships here without duplicating backend logic.</p></div>
-              </div>
-            ) : <div className="inspector-empty">Select a timeline event to inspect it.</div>
+            selectedEntry ? (
+              <>
+                <div className="inspector-tabs">
+                  {(["Details", "Output", "Evidence"] as InspectorTab[]).map((tab) => (
+                    <button key={tab} className={inspectorTab === tab ? "active" : ""} onClick={() => setInspectorTab(tab)}>{tab}{tab === "Evidence" && selectedEntry.artifacts.length > 0 ? ` ${selectedEntry.artifacts.length}` : ""}</button>
+                  ))}
+                </div>
+                <div className="inspector-body">
+                  {inspectorTab === "Details" && (
+                    <>
+                      <span className={`large-status tone-${statusTone(entryStatus(selectedEntry))}`}>{entryStatus(selectedEntry)}</span>
+                      {selectedCommand && <div className="detail-block"><span className="detail-label">Command</span><code className="command-box">{selectedCommand}</code></div>}
+                      <dl>
+                        <div><dt>Type</dt><dd>{entryTitle(selectedEntry)}</dd></div>
+                        {selectedMeta?.phase && <div><dt>Phase</dt><dd>{selectedMeta.phase}</dd></div>}
+                        {typeof selectedMeta?.expected_exit_code === "number" && <div><dt>Expected exit</dt><dd>{selectedMeta.expected_exit_code}</dd></div>}
+                        {selectedMeta?.command?.cwd && <div><dt>Working dir</dt><dd className="mono breakable">{selectedMeta.command.cwd}</dd></div>}
+                        <div><dt>Duration</dt><dd>{formatDuration(selectedEntry.execution?.duration_ms ?? null)}</dd></div>
+                        <div><dt>Receipt</dt><dd className="mono breakable">{selectedEntry.receipt?.id ?? "—"}</dd></div>
+                        <div><dt>Captured</dt><dd>{new Date(selectedEntry.action.created_at * 1000).toLocaleString()}</dd></div>
+                      </dl>
+                    </>
+                  )}
+
+                  {inspectorTab === "Output" && (
+                    <div className="output-stack">
+                      <section className="output-section">
+                        <div><strong>stdout</strong>{selectedEntry.receipt?.stdout_truncated && <span>truncated</span>}</div>
+                        <pre className="output-box">{selectedEntry.receipt?.stdout_preview || "No stdout captured."}</pre>
+                      </section>
+                      <section className="output-section">
+                        <div><strong>stderr</strong>{selectedEntry.receipt?.stderr_truncated && <span>truncated</span>}</div>
+                        <pre className="output-box">{selectedEntry.receipt?.stderr_preview || "No stderr captured."}</pre>
+                      </section>
+                      {!selectedEntry.receipt && <p className="inspector-hint">This action has no completed receipt yet.</p>}
+                    </div>
+                  )}
+
+                  {inspectorTab === "Evidence" && (
+                    selectedEntry.artifacts.length > 0 ? (
+                      <div className="artifact-list">
+                        {selectedEntry.artifacts.map((artifact) => (
+                          <article className="artifact-row" key={artifact.id}>
+                            <div className="artifact-icon">▤</div>
+                            <div><strong>{artifact.media_type || "Evidence artifact"}</strong><span>{formatBytes(artifact.size)} · {artifact.checksum.slice(0, 12)}…</span><code>{artifact.id}</code></div>
+                          </article>
+                        ))}
+                      </div>
+                    ) : <div className="inspector-empty compact">No evidence artifacts are linked to this receipt.</div>
+                  )}
+                </div>
+              </>
+            ) : <div className="inspector-empty">Select a timeline event to inspect its execution, receipt output, and evidence.</div>
           ) : (
             selectedContract ? (
               <div className="inspector-body">
@@ -358,7 +499,7 @@ function App() {
                   <div><dt>Version</dt><dd>v{selectedContract.version}</dd></div>
                   <div><dt>Checks</dt><dd>{summary?.checks.length ?? "Load to inspect"}</dd></div>
                 </dl>
-                {summary ? <div className="inspector-note success-note"><strong>Backend-evaluated verdict.</strong><p>The UI is rendering the typed outcome returned by Rust; it does not infer BEFORE/AFTER semantics on its own.</p></div> : <button className="primary-button full" onClick={() => void inspectContract(selectedContract.id)}>Evaluate contract</button>}
+                {summary ? <div className="inspector-note success-note"><strong>Backend-evaluated verdict.</strong><p>The UI renders the typed result returned by Rust. BEFORE/AFTER semantics remain in the core rather than being reconstructed in React.</p></div> : <button className="primary-button full" onClick={() => void inspectContract(selectedContract.id)}>Evaluate contract</button>}
               </div>
             ) : <div className="inspector-empty">Select an outcome contract to inspect the BEFORE → AFTER verdict.</div>
           )}
