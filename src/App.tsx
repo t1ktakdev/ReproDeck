@@ -4,10 +4,19 @@ import "./App.css";
 
 type Session = {
   id: string;
+  repo_id: string | null;
   created_at: number;
   updated_at: number | null;
   state: string;
   meta: string | null;
+};
+
+type RepositoryInfo = {
+  id: string | null;
+  path: string;
+  head_commit: string;
+  branch: string;
+  is_dirty: boolean;
 };
 
 type Action = {
@@ -130,6 +139,11 @@ const humanize = (value: string) =>
     .replace(/[_-]+/g, " ")
     .replace(/^./, (char) => char.toUpperCase());
 
+const repositoryName = (path: string) => {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.split("/").pop() || normalized;
+};
+
 function bridgeMessage(error: unknown) {
   if (typeof error === "string") return error;
   if (error && typeof error === "object") {
@@ -182,6 +196,7 @@ function Mark({ tone = "neutral" }: { tone?: string }) {
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [repository, setRepository] = useState<RepositoryInfo | null>(null);
   const [timelineEntries, setTimelineEntries] = useState<TimelineEntry[]>([]);
   const [contracts, setContracts] = useState<Contract[]>([]);
   const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
@@ -195,6 +210,9 @@ function App() {
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionId, setNewSessionId] = useState("");
   const [creating, setCreating] = useState(false);
+  const [repositoryOpen, setRepositoryOpen] = useState(false);
+  const [repositoryPath, setRepositoryPath] = useState("");
+  const [attachingRepository, setAttachingRepository] = useState(false);
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const selectedEntry = timelineEntries.find((entry) => entry.action.id === selectedActionId) ?? null;
@@ -218,16 +236,20 @@ function App() {
     setInspectorTab("Details");
     setError(null);
     try {
-      const [nextTimeline, nextContracts] = await Promise.all([
+      const [nextTimeline, nextContracts, nextRepository] = await Promise.all([
         invoke<TimelineEntry[]>("list_timeline_entries", { sessionId: id }),
         invoke<Contract[]>("list_contracts", { sessionId: id }),
+        invoke<RepositoryInfo | null>("get_session_repository", { sessionId: id }),
       ]);
       setTimelineEntries(nextTimeline ?? []);
       setContracts(nextContracts ?? []);
+      setRepository(nextRepository ?? null);
+      if (nextRepository?.path) setRepositoryPath(nextRepository.path);
     } catch (nextError) {
       setError(bridgeMessage(nextError));
       setTimelineEntries([]);
       setContracts([]);
+      setRepository(null);
     }
   }
 
@@ -262,6 +284,26 @@ function App() {
     }
   }
 
+  async function attachRepository() {
+    if (!selectedSessionId || !repositoryPath.trim()) return;
+    setAttachingRepository(true);
+    setError(null);
+    try {
+      const attached = await invoke<RepositoryInfo>("attach_repository", {
+        sessionId: selectedSessionId,
+        path: repositoryPath.trim(),
+      });
+      setRepository(attached);
+      setSessions((current) => current.map((session) => session.id === selectedSessionId ? { ...session, repo_id: attached.id } : session));
+      setRepositoryPath(attached.path);
+      setRepositoryOpen(false);
+    } catch (nextError) {
+      setError(bridgeMessage(nextError));
+    } finally {
+      setAttachingRepository(false);
+    }
+  }
+
   async function inspectContract(contractId: string) {
     setSelectedContractId(contractId);
     setError(null);
@@ -293,8 +335,11 @@ function App() {
           <strong>REPRODECK</strong>
         </div>
         <div className="workspace-crumbs">
-          <span className="repo-chip">Local workspace</span>
-          {selectedSession && <span className="branch-chip">session/{selectedSession.id}</span>}
+          <button className="repo-chip repo-button" onClick={() => selectedSession && setRepositoryOpen(true)} disabled={!selectedSession} title={repository?.path || "Attach a Git repository"}>
+            {repository ? repositoryName(repository.path) : "Attach repository"}
+          </button>
+          {repository && <span className="branch-chip">⌘ {repository.branch}</span>}
+          {repository?.is_dirty && <span className="dirty-chip">DIRTY</span>}
           <span className="isolation-chip"><i />LOCAL-FIRST</span>
         </div>
         <label className="search-box">
@@ -312,7 +357,7 @@ function App() {
 
           <nav className="nav-block" aria-label="Workspace navigation">
             <p className="section-label">Workspace</p>
-            <button><span className="nav-icon">◇</span>Repository</button>
+            <button onClick={() => selectedSession && setRepositoryOpen(true)} disabled={!selectedSession}><span className="nav-icon">◇</span>Repository <em>{repository ? "1" : ""}</em></button>
             <button><span className="nav-icon">◉</span>Sessions <em>{sessions.length}</em></button>
             <button className={view === "Timeline" ? "active" : ""} onClick={() => setView("Timeline")}><span className="nav-icon">◷</span>Timeline <em>{timelineEntries.length || ""}</em></button>
             <button className={view === "Verification" ? "active" : ""} onClick={() => setView("Verification")}><span className="nav-icon">✓</span>Verification <em>{contracts.length || ""}</em></button>
@@ -353,13 +398,21 @@ function App() {
               <section className="session-header">
                 <div>
                   <div className="title-row"><h1>{selectedSession.id}</h1><span className={`state-pill tone-${statusTone(selectedSession.state)}`}>{selectedSession.state}</span></div>
-                  <p>Session · local storage · created {formatRelative(selectedSession.created_at)}</p>
+                  <p>{repository ? `${repository.path} · HEAD ${repository.head_commit.slice(0, 8)}` : "No repository attached yet"}</p>
                 </div>
                 <div className="header-actions">
                   <button className="ghost-button" onClick={() => void refreshSessions()}>↻ Refresh</button>
-                  <button className="apply-button" disabled title="Apply UI will be enabled when repository selection is wired to the bridge">✓ Apply changes</button>
+                  {!repository && <button className="primary-button" onClick={() => setRepositoryOpen(true)}>◇ Attach repository</button>}
+                  <button className="apply-button" disabled title="Apply becomes available after the isolated shadow workspace is wired">✓ Apply changes</button>
                 </div>
               </section>
+
+              {!repository && (
+                <div className="repo-banner">
+                  <div><span>◇</span><div><strong>Attach the Git repository for this bug session</strong><p>ReproDeck will resolve the real repository root and HEAD locally. It will not modify the repository during attachment.</p></div></div>
+                  <button className="ghost-button" onClick={() => setRepositoryOpen(true)}>Choose path</button>
+                </div>
+              )}
 
               <div className="tabbar">
                 <button className={view === "Timeline" ? "active" : ""} onClick={() => setView("Timeline")}>Timeline</button>
@@ -506,14 +559,29 @@ function App() {
         </aside>
       </div>
 
-      <div className="statusbar"><span>● Core storage ready</span><span>{selectedSession ? `Session ${selectedSession.id}` : "No session selected"}</span><span>Esc back</span></div>
+      <div className="statusbar">
+        <span>● Core storage ready</span>
+        <span>{repository ? `${repositoryName(repository.path)} · ${repository.branch} · ${repository.is_dirty ? "dirty" : "clean"}` : selectedSession ? "Repository not attached" : "No session selected"}</span>
+        <span>{repository ? `HEAD ${repository.head_commit.slice(0, 8)}` : "Esc back"}</span>
+      </div>
 
       {newSessionOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => !creating && setNewSessionOpen(false)}>
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="new-session-title" onMouseDown={(event) => event.stopPropagation()}>
-            <header><span className="modal-icon">＋</span><div><h2 id="new-session-title">New bug session</h2><p>Create the local session record now; repository capture will be attached in the next vertical slice.</p></div></header>
+            <header><span className="modal-icon">＋</span><div><h2 id="new-session-title">New bug session</h2><p>Create the local session first. You can attach its Git repository immediately after creation.</p></div></header>
             <label><span>Session ID</span><input autoFocus value={newSessionId} onChange={(event) => setNewSessionId(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createSession(); }} placeholder="auth-refresh-regression" /></label>
             <footer><button className="ghost-button" disabled={creating} onClick={() => setNewSessionOpen(false)}>Cancel</button><button className="primary-button" disabled={creating || !newSessionId.trim()} onClick={() => void createSession()}>{creating ? "Creating…" : "Create session"}</button></footer>
+          </section>
+        </div>
+      )}
+
+      {repositoryOpen && selectedSession && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => !attachingRepository && setRepositoryOpen(false)}>
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="repository-title" onMouseDown={(event) => event.stopPropagation()}>
+            <header><span className="modal-icon">◇</span><div><h2 id="repository-title">Attach Git repository</h2><p>Enter a local path. ReproDeck only inspects the repository and records its canonical root, branch and HEAD during this step.</p></div></header>
+            <label><span>Repository path</span><input autoFocus value={repositoryPath} onChange={(event) => setRepositoryPath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void attachRepository(); }} placeholder="C:\\Users\\you\\Projects\\my-app" /></label>
+            {repository && <p className="repo-path-caption">Currently attached: <span>{repository.path}</span></p>}
+            <footer><button className="ghost-button" disabled={attachingRepository} onClick={() => setRepositoryOpen(false)}>Cancel</button><button className="primary-button" disabled={attachingRepository || !repositoryPath.trim()} onClick={() => void attachRepository()}>{attachingRepository ? "Inspecting…" : repository ? "Reattach" : "Attach repository"}</button></footer>
           </section>
         </div>
       )}
