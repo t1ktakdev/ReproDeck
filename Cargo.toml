@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "src-tauri"]
+members = ["crates/*", "src-tauri", "tools/bridge_tester"]
 resolver = "2"
 
 [workspace.package]

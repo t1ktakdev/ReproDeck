@@ -337,6 +337,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge_tester"
+version = "0.1.0"
+dependencies = [
+ "reprodeck",
+ "serde_json",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,6 +868,15 @@ dependencies = [
 
 [[package]]
 name = "directories"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f51c5d4ddabd36886dd3e1438cb358cdcb0d7c499cb99cb4ac2e38e18b5cb210"
+dependencies = [
+ "dirs-sys 0.3.7",
+]
+
+[[package]]
+name = "directories"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a49173b84e034382284f27f1af4dcbbd231ffa358c0fe316541a7337f376a35"
@@ -874,6 +891,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
  "dirs-sys 0.5.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b1d1d91c932ef41c0f2663aa8b0ca0342d444d842c06914aa0a7e352d0bada6"
+dependencies = [
+ "libc",
+ "redox_users 0.4.6",
+ "winapi",
 ]
 
 [[package]]
@@ -3225,7 +3253,9 @@ name = "reprodeck"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "directories 4.0.1",
  "reprodeck-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -3252,7 +3282,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "directories",
+ "directories 5.0.1",
  "git2",
  "hex",
  "libc",

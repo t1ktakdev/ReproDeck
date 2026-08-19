@@ -46,3 +46,23 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# Private/runtime/build artifacts
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa*
+*.db
+*.sqlite
+*.sqlite3
+.cache/
+**/.cache/
+.opencode/node_modules/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+

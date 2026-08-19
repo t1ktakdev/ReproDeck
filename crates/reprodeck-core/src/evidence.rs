@@ -32,7 +32,9 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
             }
         }
         if is_bad {
-            return Err(std::io::Error::other("artifact storage prefix is a symlink or reparse point"));
+            return Err(std::io::Error::other(
+                "artifact storage prefix is a symlink or reparse point",
+            ));
         }
     }
 

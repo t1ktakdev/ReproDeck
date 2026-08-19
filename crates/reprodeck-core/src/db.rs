@@ -147,6 +147,68 @@ const MIGRATIONS: &[(&str, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_artifacts_receipt ON artifacts(receipt_id);
         "
     ),
+    (
+        "4",
+        "-- migration 4: outcome verification tables and evidence_links
+        CREATE TABLE IF NOT EXISTS outcome_contracts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            state TEXT NOT NULL DEFAULT 'Draft',
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_checks (
+            id TEXT PRIMARY KEY,
+            contract_id TEXT NOT NULL,
+            stable_id TEXT NOT NULL,
+            description TEXT NOT NULL,
+            command_ref TEXT,
+            expected_condition TEXT,
+            required INTEGER DEFAULT 1,
+            ordering INTEGER DEFAULT 0,
+            FOREIGN KEY(contract_id) REFERENCES outcome_contracts(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_checks_contract ON verification_checks(contract_id);
+
+        CREATE TABLE IF NOT EXISTS verification_runs (
+            id TEXT PRIMARY KEY,
+            contract_id TEXT NOT NULL,
+            check_id TEXT,
+            phase TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at INTEGER,
+            finished_at INTEGER,
+            duration_ms INTEGER,
+            receipt_id TEXT,
+            FOREIGN KEY(contract_id) REFERENCES outcome_contracts(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_runs_contract ON verification_runs(contract_id);
+
+        CREATE TABLE IF NOT EXISTS outcome_results (
+            id TEXT PRIMARY KEY,
+            contract_id TEXT NOT NULL,
+            overall_state TEXT NOT NULL,
+            before_summary TEXT,
+            after_summary TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES outcome_contracts(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_links (
+            id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL,
+            run_id TEXT,
+            role TEXT NOT NULL,
+            FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES verification_runs(id) ON DELETE CASCADE
+        );"
+    ),
 ];
 
 fn current_migration_version() -> i64 {

@@ -1,0 +1,8 @@
+[package]
+name = "bridge_tester"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reprodeck_lib = { path = "../../src-tauri", package = "reprodeck" }
+serde_json = "1"
