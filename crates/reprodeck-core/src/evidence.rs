@@ -322,11 +322,7 @@ pub fn list_artifacts_for_receipt(
 
 /// Read an artifact only by its database identity. No arbitrary filesystem path
 /// from the frontend is accepted here.
-pub fn read_artifact(
-    conn: &Connection,
-    storage_dir: &Path,
-    artifact_id: &str,
-) -> Result<Vec<u8>> {
+pub fn read_artifact(conn: &Connection, storage_dir: &Path, artifact_id: &str) -> Result<Vec<u8>> {
     let artifact = get_artifact(conn, artifact_id)?
         .ok_or_else(|| EvidenceError::ArtifactNotFound(artifact_id.to_owned()))?;
     let relative = validate_store_key(&artifact.store_key)?;
@@ -526,8 +522,8 @@ mod tests {
         let db_file = NamedTempFile::new().unwrap();
         let mut conn = init_db(db_file.path()).unwrap();
         let receipt_id = receipt(&mut conn);
-        let contract = verification::create_outcome_contract(&conn, "session", "Outcome", None)
-            .unwrap();
+        let contract =
+            verification::create_outcome_contract(&conn, "session", "Outcome", None).unwrap();
         let check = verification::add_verification_check(
             &conn,
             &contract.id,
@@ -547,14 +543,8 @@ mod tests {
         )
         .unwrap();
         let storage = tempdir().unwrap();
-        let artifact = persist_text_artifact(
-            &conn,
-            storage.path(),
-            &receipt_id,
-            "evidence",
-            None,
-        )
-        .unwrap();
+        let artifact =
+            persist_text_artifact(&conn, storage.path(), &receipt_id, "evidence", None).unwrap();
         link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before).unwrap();
         let links = list_artifact_links_for_run(&conn, &run).unwrap();
         assert_eq!(links.len(), 1);
