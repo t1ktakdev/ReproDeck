@@ -71,10 +71,9 @@ fn parse_expected_exit_code(condition: Option<&str>) -> Result<i32> {
 
     let lower = condition.to_ascii_lowercase();
     if let Some(value) = lower.strip_prefix("exit ") {
-        return value
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| VerificationExecutionError::UnsupportedExpectedCondition(condition.into()));
+        return value.trim().parse::<i32>().map_err(|_| {
+            VerificationExecutionError::UnsupportedExpectedCondition(condition.into())
+        });
     }
 
     let compact: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -99,9 +98,7 @@ fn get_check(
     verification::list_verification_checks(conn, contract_id)?
         .into_iter()
         .find(|check| check.id == check_id)
-        .ok_or_else(|| {
-            verification::VerificationError::CheckNotFound(check_id.to_owned()).into()
-        })
+        .ok_or_else(|| verification::VerificationError::CheckNotFound(check_id.to_owned()).into())
 }
 
 fn redacted_command_meta(
@@ -370,7 +367,10 @@ mod tests {
     fn expected_condition_parser_is_deliberately_small() {
         assert_eq!(parse_expected_exit_code(None).unwrap(), 0);
         assert_eq!(parse_expected_exit_code(Some("exit 0")).unwrap(), 0);
-        assert_eq!(parse_expected_exit_code(Some("exit_code == 17")).unwrap(), 17);
+        assert_eq!(
+            parse_expected_exit_code(Some("exit_code == 17")).unwrap(),
+            17
+        );
         assert_eq!(parse_expected_exit_code(Some("exit=-1")).unwrap(), -1);
         assert!(matches!(
             parse_expected_exit_code(Some("stdout contains success")),

@@ -603,14 +603,8 @@ mod tests {
         let mut conn = init_db(db_file.path()).unwrap();
         let (run, run_receipt) = verification_run_with_receipt(&mut conn);
         let storage = tempdir().unwrap();
-        let artifact = persist_text_artifact(
-            &conn,
-            storage.path(),
-            &run_receipt,
-            "evidence",
-            None,
-        )
-        .unwrap();
+        let artifact =
+            persist_text_artifact(&conn, storage.path(), &run_receipt, "evidence", None).unwrap();
         link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before).unwrap();
         let links = list_artifact_links_for_run(&conn, &run).unwrap();
         assert_eq!(links.len(), 1);
@@ -667,14 +661,9 @@ mod tests {
         )
         .unwrap();
         let storage = tempdir().unwrap();
-        let artifact = persist_text_artifact(
-            &conn,
-            storage.path(),
-            &unrelated_receipt,
-            "evidence",
-            None,
-        )
-        .unwrap();
+        let artifact =
+            persist_text_artifact(&conn, storage.path(), &unrelated_receipt, "evidence", None)
+                .unwrap();
         assert!(matches!(
             link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before),
             Err(EvidenceError::RunNotFinished(_))
