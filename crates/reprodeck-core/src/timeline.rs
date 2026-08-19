@@ -1,5 +1,5 @@
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
@@ -105,9 +105,8 @@ fn sanitize_preview(input: &str) -> String {
         .into_owned()
 }
 
-/// Truncate a UTF-8 string to at most `max_bytes` without ever slicing inside
-/// a multi-byte scalar value. Returns the truncated string and whether bytes
-/// were omitted.
+/// Truncate a UTF-8 string to at most `max_bytes` without slicing inside a
+/// multi-byte scalar value.
 fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> (String, bool) {
     if input.len() <= max_bytes {
         return (input.to_owned(), false);
@@ -160,19 +159,14 @@ pub fn start_execution(conn: &Connection, action_id: &str) -> Result<String, Tim
     Ok(exec_id)
 }
 
-/// Finish an execution and create its receipt in a single transaction.
-/// Sanitization always happens before preview bytes cross the persistence
-/// boundary.
-pub fn finish_execution(
-    conn: &mut Connection,
+pub(crate) fn finish_execution_in_transaction(
+    tx: &Transaction<'_>,
     execution_id: &str,
     status: &str,
     stdout_preview: Option<&str>,
     stderr_preview: Option<&str>,
 ) -> Result<String, TimelineError> {
-    let tx = conn.transaction()?;
     let now = unix_time_secs()?;
-
     let started_at = tx
         .query_row(
             "SELECT started_at FROM executions WHERE id = ?1",
@@ -192,19 +186,19 @@ pub fn finish_execution(
     }
 
     const MAX_PREVIEW: usize = 1024;
-    let (sp_owned, spt) = match stdout_preview {
+    let (stdout_preview, stdout_truncated) = match stdout_preview {
         Some(s) => {
             let sanitized = sanitize_preview(s);
             let (bounded, truncated) = truncate_utf8_bytes(&sanitized, MAX_PREVIEW);
-            (Some(bounded), i64::from(truncated))
+            (Some(bounded), if truncated { 1_i64 } else { 0_i64 })
         }
         None => (None, 0),
     };
-    let (ep_owned, ept) = match stderr_preview {
+    let (stderr_preview, stderr_truncated) = match stderr_preview {
         Some(s) => {
             let sanitized = sanitize_preview(s);
             let (bounded, truncated) = truncate_utf8_bytes(&sanitized, MAX_PREVIEW);
-            (Some(bounded), i64::from(truncated))
+            (Some(bounded), if truncated { 1_i64 } else { 0_i64 })
         }
         None => (None, 0),
     };
@@ -212,9 +206,28 @@ pub fn finish_execution(
     let receipt_id = Uuid::new_v4().to_string();
     tx.execute(
         "INSERT INTO receipts (id, execution_id, summary, stdout_preview, stderr_preview, stdout_truncated, stderr_truncated, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        rusqlite::params![receipt_id, execution_id, "", sp_owned, ep_owned, spt, ept, now],
+        rusqlite::params![receipt_id, execution_id, "", stdout_preview, stderr_preview, stdout_truncated, stderr_truncated, now],
     )?;
 
+    Ok(receipt_id)
+}
+
+/// Finish an execution and create its receipt in a single transaction.
+pub fn finish_execution(
+    conn: &mut Connection,
+    execution_id: &str,
+    status: &str,
+    stdout_preview: Option<&str>,
+    stderr_preview: Option<&str>,
+) -> Result<String, TimelineError> {
+    let tx = conn.transaction()?;
+    let receipt_id = finish_execution_in_transaction(
+        &tx,
+        execution_id,
+        status,
+        stdout_preview,
+        stderr_preview,
+    )?;
     tx.commit()?;
     Ok(receipt_id)
 }
