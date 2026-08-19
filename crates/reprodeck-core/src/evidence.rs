@@ -18,6 +18,18 @@ pub enum EvidenceError {
     Clock(#[from] SystemTimeError),
     #[error("artifact not found: {0}")]
     ArtifactNotFound(String),
+    #[error("verification run not found: {0}")]
+    VerificationRunNotFound(String),
+    #[error("verification run has no receipt yet: {0}")]
+    RunNotFinished(String),
+    #[error(
+        "artifact {artifact_id} belongs to receipt {artifact_receipt}, not verification receipt {run_receipt}"
+    )]
+    ArtifactReceiptMismatch {
+        artifact_id: String,
+        artifact_receipt: String,
+        run_receipt: String,
+    },
     #[error("artifact store key is invalid")]
     InvalidStoreKey,
     #[error("artifact integrity check failed: {0}")]
@@ -86,14 +98,14 @@ fn parse_role(value: &str) -> Result<ArtifactRole> {
 }
 
 fn is_symlink_or_reparse(path: &Path) -> std::io::Result<bool> {
-    let meta = fs::symlink_metadata(path)?;
-    let is_symlink = meta.file_type().is_symlink();
+    let metadata = fs::symlink_metadata(path)?;
+    let is_symlink = metadata.file_type().is_symlink();
 
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        let is_reparse = (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let is_reparse = (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         Ok(is_symlink || is_reparse)
     }
 
@@ -343,12 +355,41 @@ pub fn read_artifact(conn: &Connection, storage_dir: &Path, artifact_id: &str) -
     Ok(bytes)
 }
 
+fn verification_receipt(conn: &Connection, run_id: &str) -> Result<String> {
+    let receipt = conn
+        .query_row(
+            "SELECT receipt_id FROM verification_runs WHERE id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| EvidenceError::VerificationRunNotFound(run_id.to_owned()))?;
+    receipt.ok_or_else(|| EvidenceError::RunNotFinished(run_id.to_owned()))
+}
+
+/// Link an artifact to a verification run only when the artifact was produced by
+/// the very same receipt that completed that run. This prevents a valid artifact
+/// from another command/run being relabelled as BEFORE/AFTER proof.
 pub fn link_artifact(
     conn: &Connection,
     artifact_id: &str,
     run_id: Option<&str>,
     role: ArtifactRole,
 ) -> Result<ArtifactLink> {
+    let artifact = get_artifact(conn, artifact_id)?
+        .ok_or_else(|| EvidenceError::ArtifactNotFound(artifact_id.to_owned()))?;
+
+    if let Some(run_id) = run_id {
+        let run_receipt = verification_receipt(conn, run_id)?;
+        if artifact.receipt_id != run_receipt {
+            return Err(EvidenceError::ArtifactReceiptMismatch {
+                artifact_id: artifact_id.to_owned(),
+                artifact_receipt: artifact.receipt_id,
+                run_receipt,
+            });
+        }
+    }
+
     let id = Uuid::new_v4().to_string();
     let created_at = unix_time_secs()?;
     conn.execute(
@@ -398,10 +439,16 @@ mod tests {
     use crate::{db::init_db, timeline, verification};
     use tempfile::{tempdir, NamedTempFile};
 
-    fn receipt(conn: &mut Connection) -> String {
-        timeline::create_session(conn, "session", "Active", None).unwrap();
+    fn ensure_session(conn: &Connection) {
+        if timeline::get_session(conn, "session").unwrap().is_none() {
+            timeline::create_session(conn, "session", "Active", None).unwrap();
+        }
+    }
+
+    fn receipt(conn: &mut Connection, suffix: &str) -> String {
+        ensure_session(conn);
         let action = timeline::Action {
-            id: "action".to_string(),
+            id: format!("action-{suffix}"),
             session_id: "session".to_string(),
             parent_id: None,
             kind: "command".to_string(),
@@ -412,6 +459,39 @@ mod tests {
         timeline::create_action(conn, &action).unwrap();
         let execution = timeline::start_execution(conn, &action.id).unwrap();
         timeline::finish_execution(conn, &execution, "Succeeded", None, None).unwrap()
+    }
+
+    fn verification_run_with_receipt(conn: &mut Connection) -> (String, String) {
+        ensure_session(conn);
+        let contract =
+            verification::create_outcome_contract(conn, "session", "Outcome", None).unwrap();
+        let check = verification::add_verification_check(
+            conn,
+            &contract.id,
+            "check",
+            "Check",
+            None,
+            Some("exit 0"),
+            true,
+            0,
+        )
+        .unwrap();
+        let run = verification::start_verification_check_run(
+            conn,
+            &contract.id,
+            &check.id,
+            verification::RunPhase::Before,
+        )
+        .unwrap();
+        let receipt = verification::finish_verification_run_with_output(
+            conn,
+            &run,
+            verification::RunStatus::Failed,
+            Some("evidence"),
+            None,
+        )
+        .unwrap();
+        (run, receipt)
     }
 
     #[test]
@@ -473,7 +553,7 @@ mod tests {
     fn text_is_redacted_before_artifact_storage() {
         let db_file = NamedTempFile::new().unwrap();
         let mut conn = init_db(db_file.path()).unwrap();
-        let receipt_id = receipt(&mut conn);
+        let receipt_id = receipt(&mut conn, "redaction");
         let storage = tempdir().unwrap();
         let secret = "password=hunter2 Bearer secret-token";
         let artifact = persist_text_artifact(
@@ -495,7 +575,7 @@ mod tests {
     fn artifact_read_uses_database_identity_and_verifies_integrity() {
         let db_file = NamedTempFile::new().unwrap();
         let mut conn = init_db(db_file.path()).unwrap();
-        let receipt_id = receipt(&mut conn);
+        let receipt_id = receipt(&mut conn, "integrity");
         let storage = tempdir().unwrap();
         let artifact = persist_binary_attachment(
             &conn,
@@ -518,19 +598,63 @@ mod tests {
     }
 
     #[test]
-    fn artifact_links_use_verification_run_and_role() {
+    fn artifact_links_require_same_verification_receipt() {
         let db_file = NamedTempFile::new().unwrap();
         let mut conn = init_db(db_file.path()).unwrap();
-        let receipt_id = receipt(&mut conn);
+        let (run, run_receipt) = verification_run_with_receipt(&mut conn);
+        let storage = tempdir().unwrap();
+        let artifact = persist_text_artifact(
+            &conn,
+            storage.path(),
+            &run_receipt,
+            "evidence",
+            None,
+        )
+        .unwrap();
+        link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before).unwrap();
+        let links = list_artifact_links_for_run(&conn, &run).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].role, ArtifactRole::Before);
+        assert_eq!(links[0].artifact_id, artifact.id);
+    }
+
+    #[test]
+    fn artifact_from_another_receipt_cannot_be_relabelled_as_run_proof() {
+        let db_file = NamedTempFile::new().unwrap();
+        let mut conn = init_db(db_file.path()).unwrap();
+        let unrelated_receipt = receipt(&mut conn, "unrelated");
+        let (run, _run_receipt) = verification_run_with_receipt(&mut conn);
+        let storage = tempdir().unwrap();
+        let artifact = persist_text_artifact(
+            &conn,
+            storage.path(),
+            &unrelated_receipt,
+            "unrelated evidence",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before),
+            Err(EvidenceError::ArtifactReceiptMismatch { .. })
+        ));
+        assert!(list_artifact_links_for_run(&conn, &run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unfinished_run_cannot_receive_proof_artifact() {
+        let db_file = NamedTempFile::new().unwrap();
+        let mut conn = init_db(db_file.path()).unwrap();
+        ensure_session(&conn);
+        let unrelated_receipt = receipt(&mut conn, "unfinished");
         let contract =
             verification::create_outcome_contract(&conn, "session", "Outcome", None).unwrap();
         let check = verification::add_verification_check(
             &conn,
             &contract.id,
-            "check",
+            "unfinished-check",
             "Check",
             None,
-            None,
+            Some("exit 0"),
             true,
             0,
         )
@@ -543,13 +667,18 @@ mod tests {
         )
         .unwrap();
         let storage = tempdir().unwrap();
-        let artifact =
-            persist_text_artifact(&conn, storage.path(), &receipt_id, "evidence", None).unwrap();
-        link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before).unwrap();
-        let links = list_artifact_links_for_run(&conn, &run).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].role, ArtifactRole::Before);
-        assert_eq!(links[0].artifact_id, artifact.id);
+        let artifact = persist_text_artifact(
+            &conn,
+            storage.path(),
+            &unrelated_receipt,
+            "evidence",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            link_artifact(&conn, &artifact.id, Some(&run), ArtifactRole::Before),
+            Err(EvidenceError::RunNotFinished(_))
+        ));
     }
 
     #[test]
