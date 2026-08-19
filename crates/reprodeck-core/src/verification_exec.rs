@@ -93,8 +93,12 @@ fn runner_issue(error: &CommandError) -> (&'static str, RunStatus) {
         CommandError::SpawnFailed(_) => ("spawn_failed", RunStatus::Error),
         CommandError::Io(_) => ("io_error", RunStatus::Error),
         CommandError::OutputLimitExceeded => ("output_limit_exceeded", RunStatus::Error),
-        CommandError::PermissionDenied => ("permission_denied_after_authorization", RunStatus::Error),
-        CommandError::DecisionRequired => ("decision_required_after_authorization", RunStatus::Error),
+        CommandError::PermissionDenied => {
+            ("permission_denied_after_authorization", RunStatus::Error)
+        }
+        CommandError::DecisionRequired => {
+            ("decision_required_after_authorization", RunStatus::Error)
+        }
     }
 }
 
@@ -281,8 +285,10 @@ mod tests {
     }
 
     fn run_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM verification_runs", [], |row| row.get(0))
-            .unwrap()
+        conn.query_row("SELECT COUNT(*) FROM verification_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -369,7 +375,11 @@ mod tests {
             &contract.id,
             &check.id,
             RunPhase::After,
-            git_spec(&["rev-parse", "--verify", "refs/heads/reprodeck-definitely-missing"]),
+            git_spec(&[
+                "rev-parse",
+                "--verify",
+                "refs/heads/reprodeck-definitely-missing",
+            ]),
             Permission::Allow,
             None,
         )
