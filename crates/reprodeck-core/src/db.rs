@@ -35,9 +35,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "2",
         // migration 2: sessions, shadow_workspaces, command_executions, timeline_events, evidence, outcome_criteria
         "CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            repo_id TEXT NOT NULL,
-            started_at INTEGER NOT NULL
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
+            repo_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER,
+            state TEXT NOT NULL DEFAULT 'Active',
+            meta TEXT
         );
 
         CREATE TABLE IF NOT EXISTS shadow_workspaces (
@@ -80,55 +84,62 @@ const MIGRATIONS: &[(&str, &str)] = &[
             spec TEXT NOT NULL
         );
         INSERT OR IGNORE INTO reprodeck_meta (key, value) VALUES ('schema_version', '1');",
+    ),
     (
         "3",
-        -- migration 3: actions, executions, receipts, artifacts
-        "CREATE TABLE IF NOT EXISTS actions (
-            id TEXT PRIMARY KEY,
+        // migration 3: actions, executions, receipts, artifacts
+        "CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id);
+
+        CREATE TABLE IF NOT EXISTS actions (
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
             session_id TEXT NOT NULL,
             parent_id TEXT,
             kind TEXT NOT NULL,
             meta TEXT,
             state TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            FOREIGN KEY(session_id) REFERENCES sessions(id)
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
 
         CREATE INDEX IF NOT EXISTS idx_actions_session ON actions(session_id);
 
         CREATE TABLE IF NOT EXISTS executions (
-            id TEXT PRIMARY KEY,
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
             action_id TEXT NOT NULL,
             status TEXT NOT NULL,
             started_at INTEGER NOT NULL,
             finished_at INTEGER,
             duration_ms INTEGER,
-            FOREIGN KEY(action_id) REFERENCES actions(id)
+            FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
 
         CREATE INDEX IF NOT EXISTS idx_executions_action ON executions(action_id);
 
         CREATE TABLE IF NOT EXISTS receipts (
-            id TEXT PRIMARY KEY,
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
             execution_id TEXT NOT NULL,
             summary TEXT,
             stdout_preview TEXT,
             stderr_preview TEXT,
             created_at INTEGER NOT NULL,
-            FOREIGN KEY(execution_id) REFERENCES executions(id)
+            FOREIGN KEY(execution_id) REFERENCES executions(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
 
         CREATE INDEX IF NOT EXISTS idx_receipts_execution ON receipts(execution_id);
 
         CREATE TABLE IF NOT EXISTS artifacts (
-            id TEXT PRIMARY KEY,
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
             receipt_id TEXT NOT NULL,
             store_key TEXT NOT NULL,
             checksum TEXT NOT NULL,
             size INTEGER NOT NULL,
             media_type TEXT,
             created_at INTEGER NOT NULL,
-            FOREIGN KEY(receipt_id) REFERENCES receipts(id)
+            FOREIGN KEY(receipt_id) REFERENCES receipts(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
 
         CREATE INDEX IF NOT EXISTS idx_artifacts_receipt ON artifacts(receipt_id);
@@ -193,8 +204,13 @@ fn apply_migrations(conn: &mut Connection) -> MResult<()> {
 pub fn init_db(path: &Path) -> MResult<Connection> {
     let mut conn = Connection::open(path)?;
 
-    // pragmas
+    // pragmas and connection-level settings
+    // enable foreign keys
     conn.pragma_update(None, "foreign_keys", true)?;
+    // journal mode and synchronous for WAL durability/performance tradeoff
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    // busy timeout (ms)
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
 
     // ensure reprodeck_meta exists so we can store schema_version
     conn.execute_batch(
@@ -220,6 +236,19 @@ mod tests {
 
         let ver = get_db_schema_version(&conn).unwrap();
         assert_eq!(ver, current_migration_version());
+    }
+
+    #[test]
+    fn pragmas_and_foreign_keys_enabled() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let conn = init_db(path).expect("init db");
+        // check foreign_keys pragma
+        let fk: i64 = conn.query_row("PRAGMA foreign_keys;", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 1);
+        // check journal_mode (string)
+        let jm: String = conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0)).unwrap();
+        assert!(jm.eq_ignore_ascii_case("wal"));
     }
 
     #[test]
