@@ -1,5 +1,11 @@
+mod shadow_bridge;
+
 use reprodeck_core::{db, evidence, repository, timeline, verification};
 use serde::{Deserialize, Serialize};
+use shadow_bridge::{
+    apply_shadow_workspace, create_shadow_workspace, discard_shadow_workspace,
+    finalize_shadow_workspace, get_shadow_workspace, refresh_shadow_workspace,
+};
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 
@@ -541,6 +547,12 @@ pub fn run() {
             list_verification_runs,
             get_outcome_summary,
             evaluate_contract,
+            get_shadow_workspace,
+            create_shadow_workspace,
+            refresh_shadow_workspace,
+            finalize_shadow_workspace,
+            apply_shadow_workspace,
+            discard_shadow_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
