@@ -295,7 +295,9 @@ pub fn list_actions_service(session_id: &str) -> Result<Vec<ActionDto>, BridgeEr
         .map_err(|_| BridgeError::database("Unable to load the session timeline."))
 }
 
-pub fn list_timeline_entries_service(session_id: &str) -> Result<Vec<TimelineEntryDto>, BridgeError> {
+pub fn list_timeline_entries_service(
+    session_id: &str,
+) -> Result<Vec<TimelineEntryDto>, BridgeError> {
     let conn = open_conn()?;
     let actions = timeline::list_actions(&conn, session_id, None, 500)
         .map_err(|_| BridgeError::database("Unable to load the session timeline."))?;
