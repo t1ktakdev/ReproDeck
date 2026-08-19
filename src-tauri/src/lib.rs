@@ -1,4 +1,4 @@
-use reprodeck_core::{db, timeline, verification};
+use reprodeck_core::{db, evidence, timeline, verification};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 use std::path::PathBuf;
@@ -44,18 +44,47 @@ pub struct ActionDto {
     pub id: String,
     pub kind: String,
     pub state: String,
+    pub meta: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionDto {
+    pub id: String,
+    pub action_id: String,
+    pub status: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReceiptDto {
     pub id: String,
     pub execution_id: String,
+    pub summary: Option<String>,
     pub stdout_preview: Option<String>,
     pub stderr_preview: Option<String>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactDto {
+    pub id: String,
+    pub receipt_id: String,
+    pub checksum: String,
+    pub size: i64,
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimelineEntryDto {
+    pub action: ActionDto,
+    pub execution: Option<ExecutionDto>,
+    pub receipt: Option<ReceiptDto>,
+    pub artifacts: Vec<ArtifactDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,7 +150,21 @@ impl From<timeline::ActionRecord> for ActionDto {
             id: value.id,
             kind: value.kind,
             state: value.state,
+            meta: value.meta,
             created_at: value.created_at,
+        }
+    }
+}
+
+impl From<timeline::ExecutionRecord> for ExecutionDto {
+    fn from(value: timeline::ExecutionRecord) -> Self {
+        Self {
+            id: value.id,
+            action_id: value.action_id,
+            status: value.status,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            duration_ms: value.duration_ms,
         }
     }
 }
@@ -131,11 +174,24 @@ impl From<timeline::ReceiptRecord> for ReceiptDto {
         Self {
             id: value.id,
             execution_id: value.execution_id,
+            summary: value.summary,
             stdout_preview: value.stdout_preview,
             stderr_preview: value.stderr_preview,
             stdout_truncated: value.stdout_truncated,
             stderr_truncated: value.stderr_truncated,
             created_at: value.created_at,
+        }
+    }
+}
+
+impl From<evidence::ArtifactRecord> for ArtifactDto {
+    fn from(value: evidence::ArtifactRecord) -> Self {
+        Self {
+            id: value.id,
+            receipt_id: value.receipt_id,
+            checksum: value.checksum,
+            size: value.size,
+            media_type: value.media_type,
         }
     }
 }
@@ -239,6 +295,49 @@ pub fn list_actions_service(session_id: &str) -> Result<Vec<ActionDto>, BridgeEr
         .map_err(|_| BridgeError::database("Unable to load the session timeline."))
 }
 
+pub fn list_timeline_entries_service(session_id: &str) -> Result<Vec<TimelineEntryDto>, BridgeError> {
+    let conn = open_conn()?;
+    let actions = timeline::list_actions(&conn, session_id, None, 500)
+        .map_err(|_| BridgeError::database("Unable to load the session timeline."))?;
+    let mut entries = Vec::with_capacity(actions.len());
+
+    for action in actions {
+        let action_id = action.id.clone();
+        let execution = timeline::list_executions(&conn, &action_id)
+            .map_err(|_| BridgeError::database("Unable to load action executions."))?
+            .into_iter()
+            .last();
+
+        let (receipt, artifacts) = if let Some(execution) = execution.as_ref() {
+            let receipt = timeline::list_receipts(&conn, &execution.id)
+                .map_err(|_| BridgeError::database("Unable to load execution receipts."))?
+                .into_iter()
+                .last();
+            let artifacts = if let Some(receipt) = receipt.as_ref() {
+                evidence::list_artifacts_for_receipt(&conn, &receipt.id)
+                    .map_err(|_| BridgeError::database("Unable to load receipt evidence."))?
+                    .into_iter()
+                    .map(ArtifactDto::from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (receipt.map(ReceiptDto::from), artifacts)
+        } else {
+            (None, Vec::new())
+        };
+
+        entries.push(TimelineEntryDto {
+            action: ActionDto::from(action),
+            execution: execution.map(ExecutionDto::from),
+            receipt,
+            artifacts,
+        });
+    }
+
+    Ok(entries)
+}
+
 pub fn get_receipt_service(receipt_id: &str) -> Result<ReceiptDto, BridgeError> {
     let conn = open_conn()?;
     timeline::get_receipt(&conn, receipt_id)
@@ -297,6 +396,11 @@ fn list_actions(session_id: String) -> Result<Vec<ActionDto>, BridgeError> {
 }
 
 #[tauri::command]
+fn list_timeline_entries(session_id: String) -> Result<Vec<TimelineEntryDto>, BridgeError> {
+    list_timeline_entries_service(&session_id)
+}
+
+#[tauri::command]
 fn get_receipt(receipt_id: String) -> Result<ReceiptDto, BridgeError> {
     get_receipt_service(&receipt_id)
 }
@@ -329,6 +433,7 @@ pub fn run() {
             list_sessions,
             create_session,
             list_actions,
+            list_timeline_entries,
             get_receipt,
             list_contracts,
             list_verification_runs,
@@ -358,6 +463,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["verdict"], "VerifiedFix");
+    }
+
+    #[test]
+    fn action_dto_keeps_sanitized_metadata_surface() {
+        let dto = ActionDto::from(timeline::ActionRecord {
+            created_seq: 1,
+            id: "action".to_string(),
+            session_id: "session".to_string(),
+            parent_id: None,
+            kind: "verification".to_string(),
+            meta: Some("{\"phase\":\"Before\"}".to_string()),
+            state: "Completed".to_string(),
+            created_at: 10,
+        });
+        assert_eq!(dto.meta.as_deref(), Some("{\"phase\":\"Before\"}"));
     }
 
     #[test]
