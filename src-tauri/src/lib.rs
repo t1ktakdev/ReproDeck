@@ -1,5 +1,4 @@
 use reprodeck_core::{db, timeline, verification};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
 use std::path::PathBuf;
@@ -18,8 +17,8 @@ impl BridgeError {
         }
     }
 
-    fn database(context: &str, error: impl Display) -> Self {
-        Self::new("database_error", format!("{context}: {error}"))
+    fn database(context: &str) -> Self {
+        Self::new("database_error", context)
     }
 }
 
@@ -35,7 +34,7 @@ impl std::error::Error for BridgeError {}
 pub struct SessionDto {
     pub id: String,
     pub created_at: i64,
-    pub updated_at: i64,
+    pub updated_at: Option<i64>,
     pub state: String,
     pub meta: Option<String>,
 }
@@ -76,7 +75,7 @@ pub struct VerificationRunDto {
     pub check_id: Option<String>,
     pub phase: String,
     pub status: String,
-    pub started_at: i64,
+    pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub receipt_id: Option<String>,
 }
@@ -84,6 +83,43 @@ pub struct VerificationRunDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerdictDto {
     pub verdict: String,
+}
+
+impl From<timeline::SessionRecord> for SessionDto {
+    fn from(value: timeline::SessionRecord) -> Self {
+        Self {
+            id: value.id,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            state: value.state,
+            meta: value.meta,
+        }
+    }
+}
+
+impl From<timeline::ActionRecord> for ActionDto {
+    fn from(value: timeline::ActionRecord) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            state: value.state,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<timeline::ReceiptRecord> for ReceiptDto {
+    fn from(value: timeline::ReceiptRecord) -> Self {
+        Self {
+            id: value.id,
+            execution_id: value.execution_id,
+            stdout_preview: value.stdout_preview,
+            stderr_preview: value.stderr_preview,
+            stdout_truncated: value.stdout_truncated,
+            stderr_truncated: value.stderr_truncated,
+            created_at: value.created_at,
+        }
+    }
 }
 
 fn app_db_path() -> PathBuf {
@@ -99,32 +135,15 @@ fn app_db_path() -> PathBuf {
 }
 
 fn open_conn() -> Result<rusqlite::Connection, BridgeError> {
-    db::init_db(&app_db_path()).map_err(|error| BridgeError::database("initialize database", error))
+    db::init_db(&app_db_path())
+        .map_err(|_| BridgeError::database("Unable to initialize ReproDeck storage."))
 }
 
 pub fn list_sessions_service() -> Result<Vec<SessionDto>, BridgeError> {
     let conn = open_conn()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, created_at, updated_at, state, meta \
-             FROM sessions ORDER BY created_at DESC, id DESC",
-        )
-        .map_err(|error| BridgeError::database("prepare session query", error))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(SessionDto {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                updated_at: row.get(2)?,
-                state: row.get(3)?,
-                meta: row.get(4)?,
-            })
-        })
-        .map_err(|error| BridgeError::database("query sessions", error))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| BridgeError::database("decode session row", error))
+    timeline::list_sessions(&conn, None, 200)
+        .map(|values| values.into_iter().map(SessionDto::from).collect())
+        .map_err(|_| BridgeError::database("Unable to list sessions."))
 }
 
 pub fn create_session_service(id: &str) -> Result<SessionDto, BridgeError> {
@@ -132,93 +151,47 @@ pub fn create_session_service(id: &str) -> Result<SessionDto, BridgeError> {
     if id.is_empty() {
         return Err(BridgeError::new(
             "invalid_request",
-            "session id must not be empty",
+            "Session id must not be empty.",
         ));
     }
 
     let conn = open_conn()?;
     timeline::create_session(&conn, id, "Active", None)
-        .map_err(|error| BridgeError::database("create session", error))?;
-
-    conn.query_row(
-        "SELECT id, created_at, updated_at, state, meta FROM sessions WHERE id = ?1",
-        rusqlite::params![id],
-        |row| {
-            Ok(SessionDto {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                updated_at: row.get(2)?,
-                state: row.get(3)?,
-                meta: row.get(4)?,
-            })
-        },
-    )
-    .map_err(|error| BridgeError::database("read created session", error))
+        .map_err(|_| BridgeError::database("Unable to create the session."))?;
+    timeline::get_session_record(&conn, id)
+        .map_err(|_| BridgeError::database("Unable to read the created session."))?
+        .map(SessionDto::from)
+        .ok_or_else(|| BridgeError::database("Created session could not be loaded."))
 }
 
 pub fn list_actions_service(session_id: &str) -> Result<Vec<ActionDto>, BridgeError> {
     let conn = open_conn()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, kind, state, created_at FROM actions \
-             WHERE session_id = ?1 ORDER BY created_seq DESC",
-        )
-        .map_err(|error| BridgeError::database("prepare action query", error))?;
-
-    let rows = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            Ok(ActionDto {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                state: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })
-        .map_err(|error| BridgeError::database("query actions", error))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| BridgeError::database("decode action row", error))
+    timeline::list_actions(&conn, session_id, None, 500)
+        .map(|values| values.into_iter().map(ActionDto::from).collect())
+        .map_err(|_| BridgeError::database("Unable to load the session timeline."))
 }
 
 pub fn get_receipt_service(receipt_id: &str) -> Result<ReceiptDto, BridgeError> {
     let conn = open_conn()?;
-    conn.query_row(
-        "SELECT id, execution_id, stdout_preview, stderr_preview, \
-         stdout_truncated, stderr_truncated, created_at \
-         FROM receipts WHERE id = ?1",
-        rusqlite::params![receipt_id],
-        |row| {
-            Ok(ReceiptDto {
-                id: row.get(0)?,
-                execution_id: row.get(1)?,
-                stdout_preview: row.get(2)?,
-                stderr_preview: row.get(3)?,
-                stdout_truncated: row.get::<_, i64>(4)? != 0,
-                stderr_truncated: row.get::<_, i64>(5)? != 0,
-                created_at: row.get(6)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| BridgeError::database("query receipt", error))?
-    .ok_or_else(|| BridgeError::new("not_found", "receipt not found"))
+    timeline::get_receipt(&conn, receipt_id)
+        .map_err(|_| BridgeError::database("Unable to load the receipt."))?
+        .map(ReceiptDto::from)
+        .ok_or_else(|| BridgeError::new("not_found", "Receipt not found."))
 }
 
 pub fn list_contracts_service(session_id: Option<&str>) -> Result<Vec<ContractDto>, BridgeError> {
     let conn = open_conn()?;
     let sql = match session_id {
         Some(_) => {
-            "SELECT id, session_id, title, description, state, version, created_at \
-             FROM outcome_contracts WHERE session_id = ?1 ORDER BY created_at DESC, id DESC"
+            "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts WHERE session_id = ?1 ORDER BY created_at DESC, id DESC"
         }
         None => {
-            "SELECT id, session_id, title, description, state, version, created_at \
-             FROM outcome_contracts ORDER BY created_at DESC, id DESC"
+            "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts ORDER BY created_at DESC, id DESC"
         }
     };
     let mut stmt = conn
         .prepare(sql)
-        .map_err(|error| BridgeError::database("prepare contract query", error))?;
+        .map_err(|_| BridgeError::database("Unable to prepare the outcome query."))?;
 
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ContractDto> {
         Ok(ContractDto {
@@ -234,15 +207,15 @@ pub fn list_contracts_service(session_id: Option<&str>) -> Result<Vec<ContractDt
 
     let contracts = if let Some(session_id) = session_id {
         stmt.query_map(rusqlite::params![session_id], map_row)
-            .map_err(|error| BridgeError::database("query contracts", error))?
+            .map_err(|_| BridgeError::database("Unable to query outcome contracts."))?
             .collect::<Result<Vec<_>, _>>()
     } else {
         stmt.query_map([], map_row)
-            .map_err(|error| BridgeError::database("query contracts", error))?
+            .map_err(|_| BridgeError::database("Unable to query outcome contracts."))?
             .collect::<Result<Vec<_>, _>>()
     };
 
-    contracts.map_err(|error| BridgeError::database("decode contract row", error))
+    contracts.map_err(|_| BridgeError::database("Unable to decode outcome contracts."))
 }
 
 pub fn list_verification_runs_service(
@@ -251,11 +224,9 @@ pub fn list_verification_runs_service(
     let conn = open_conn()?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, check_id, phase, status, started_at, finished_at, receipt_id \
-             FROM verification_runs WHERE contract_id = ?1 \
-             ORDER BY started_at DESC, id DESC",
+            "SELECT id, check_id, phase, status, started_at, finished_at, receipt_id FROM verification_runs WHERE contract_id = ?1 ORDER BY started_at DESC, id DESC",
         )
-        .map_err(|error| BridgeError::database("prepare verification query", error))?;
+        .map_err(|_| BridgeError::database("Unable to prepare the verification query."))?;
 
     let rows = stmt
         .query_map(rusqlite::params![contract_id], |row| {
@@ -269,16 +240,20 @@ pub fn list_verification_runs_service(
                 receipt_id: row.get(6)?,
             })
         })
-        .map_err(|error| BridgeError::database("query verification runs", error))?;
+        .map_err(|_| BridgeError::database("Unable to query verification runs."))?;
 
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| BridgeError::database("decode verification row", error))
+        .map_err(|_| BridgeError::database("Unable to decode verification runs."))
 }
 
 pub fn evaluate_contract_service(contract_id: &str) -> Result<VerdictDto, BridgeError> {
     let conn = open_conn()?;
-    let verdict = verification::evaluate_outcome(&conn, contract_id)
-        .map_err(|error| BridgeError::new("evaluation_failed", error.to_string()))?;
+    let verdict = verification::evaluate_outcome(&conn, contract_id).map_err(|_| {
+        BridgeError::new(
+            "evaluation_failed",
+            "Unable to evaluate this outcome contract.",
+        )
+    })?;
     Ok(VerdictDto { verdict })
 }
 
@@ -353,5 +328,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["verdict"], "VerifiedFix");
+    }
+
+    #[test]
+    fn bridge_error_does_not_require_internal_error_text() {
+        let error = BridgeError::database("Unable to load timeline.");
+        assert_eq!(error.code, "database_error");
+        assert_eq!(error.message, "Unable to load timeline.");
     }
 }
