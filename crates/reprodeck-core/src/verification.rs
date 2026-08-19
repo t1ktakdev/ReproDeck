@@ -2,8 +2,35 @@ use crate::timeline;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use thiserror::Error;
 use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum VerificationError {
+    #[error(transparent)]
+    Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Timeline(#[from] timeline::TimelineError),
+    #[error(transparent)]
+    Clock(#[from] SystemTimeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("verification run not found: {0}")]
+    RunNotFound(String),
+    #[error("verification check not found or does not belong to contract: {0}")]
+    CheckNotFound(String),
+    #[error("verification run cannot finish from status {0}")]
+    InvalidFinishStatus(RunStatus),
+    #[error("receipt {receipt_id} does not belong to verification run {run_id}")]
+    ReceiptMismatch { run_id: String, receipt_id: String },
+}
+
+type Result<T> = std::result::Result<T, VerificationError>;
+
+fn unix_time_secs() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutcomeContract {
@@ -17,7 +44,7 @@ pub struct OutcomeContract {
     pub updated_at: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerificationCheck {
     pub id: String,
     pub contract_id: String,
@@ -45,6 +72,14 @@ pub enum RunStatus {
     Interrupted,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub enum OutcomeState {
+    VerifiedFix,
+    ReproductionNotProven,
+    NotFixed,
+    Inconclusive,
+}
+
 impl Display for RunPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -67,17 +102,37 @@ impl Display for RunStatus {
     }
 }
 
+impl Display for OutcomeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutcomeState::VerifiedFix => write!(f, "VerifiedFix"),
+            OutcomeState::ReproductionNotProven => write!(f, "ReproductionNotProven"),
+            OutcomeState::NotFixed => write!(f, "NotFixed"),
+            OutcomeState::Inconclusive => write!(f, "Inconclusive"),
+        }
+    }
+}
+
+fn parse_run_status(value: &str) -> Option<RunStatus> {
+    match value {
+        "Pending" => Some(RunStatus::Pending),
+        "Running" => Some(RunStatus::Running),
+        "Passed" => Some(RunStatus::Passed),
+        "Failed" => Some(RunStatus::Failed),
+        "Error" => Some(RunStatus::Error),
+        "Interrupted" => Some(RunStatus::Interrupted),
+        _ => None,
+    }
+}
+
 pub fn create_outcome_contract(
     conn: &Connection,
     session_id: &str,
     title: &str,
     description: Option<&str>,
-) -> Result<OutcomeContract, rusqlite::Error> {
+) -> Result<OutcomeContract> {
     let id = Uuid::new_v4().to_string();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = unix_time_secs()?;
     conn.execute(
         "INSERT INTO outcome_contracts (id, session_id, title, description, state, version, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         rusqlite::params![id, session_id, title, description, "Draft", 1, now],
@@ -86,7 +141,7 @@ pub fn create_outcome_contract(
         id,
         session_id: session_id.to_string(),
         title: title.to_string(),
-        description: description.map(|s| s.to_string()),
+        description: description.map(str::to_owned),
         state: "Draft".to_string(),
         version: 1,
         created_at: now,
@@ -94,14 +149,11 @@ pub fn create_outcome_contract(
     })
 }
 
-pub fn get_outcome_contract(
-    conn: &Connection,
-    id: &str,
-) -> Result<Option<OutcomeContract>, rusqlite::Error> {
+pub fn get_outcome_contract(conn: &Connection, id: &str) -> Result<Option<OutcomeContract>> {
     let mut stmt = conn.prepare("SELECT id, session_id, title, description, state, version, created_at, updated_at FROM outcome_contracts WHERE id = ?1")?;
     let mut rows = stmt.query(rusqlite::params![id])?;
     if let Some(r) = rows.next()? {
-        let c = OutcomeContract {
+        Ok(Some(OutcomeContract {
             id: r.get(0)?,
             session_id: r.get(1)?,
             title: r.get(2)?,
@@ -110,102 +162,305 @@ pub fn get_outcome_contract(
             version: r.get(5)?,
             created_at: r.get(6)?,
             updated_at: r.get(7)?,
-        };
-        Ok(Some(c))
+        }))
     } else {
         Ok(None)
     }
 }
 
-/// Start a verification run. This creates a Timeline Action and starts an execution; it records a verification_runs row with status Running.
-pub fn start_verification_run(
+pub fn add_verification_check(
     conn: &Connection,
     contract_id: &str,
-    phase: RunPhase,
-) -> Result<String, timeline::TimelineError> {
-    let run_id = Uuid::new_v4().to_string();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    stable_id: &str,
+    description: &str,
+    command_ref: Option<&str>,
+    expected_condition: Option<&str>,
+    required: bool,
+    ordering: i64,
+) -> Result<VerificationCheck> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO verification_checks (id, contract_id, stable_id, description, command_ref, expected_condition, required, ordering) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![id, contract_id, stable_id, description, command_ref, expected_condition, required, ordering],
+    )?;
+    Ok(VerificationCheck {
+        id,
+        contract_id: contract_id.to_owned(),
+        stable_id: stable_id.to_owned(),
+        description: description.to_owned(),
+        command_ref: command_ref.map(str::to_owned),
+        expected_condition: expected_condition.map(str::to_owned),
+        required,
+        ordering,
+    })
+}
 
-    // find session_id for contract to populate action
+pub fn list_verification_checks(
+    conn: &Connection,
+    contract_id: &str,
+) -> Result<Vec<VerificationCheck>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, contract_id, stable_id, description, command_ref, expected_condition, required, ordering FROM verification_checks WHERE contract_id = ?1 ORDER BY ordering, id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![contract_id], |r| {
+        Ok(VerificationCheck {
+            id: r.get(0)?,
+            contract_id: r.get(1)?,
+            stable_id: r.get(2)?,
+            description: r.get(3)?,
+            command_ref: r.get(4)?,
+            expected_condition: r.get(5)?,
+            required: r.get(6)?,
+            ordering: r.get(7)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(VerificationError::Db)
+}
+
+fn start_run(
+    conn: &Connection,
+    contract_id: &str,
+    check_id: Option<&str>,
+    phase: RunPhase,
+) -> Result<String> {
+    if let Some(check_id) = check_id {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM verification_checks WHERE id = ?1 AND contract_id = ?2",
+                rusqlite::params![check_id, contract_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(VerificationError::CheckNotFound(check_id.to_owned()));
+        }
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let now = unix_time_secs()?;
     let session_id: String = conn.query_row(
         "SELECT session_id FROM outcome_contracts WHERE id = ?1",
         rusqlite::params![contract_id],
         |r| r.get(0),
     )?;
 
-    // create action
+    let meta = serde_json::to_string(&serde_json::json!({
+        "contract_id": contract_id,
+        "check_id": check_id,
+        "phase": phase.to_string(),
+    }))?;
     let action = timeline::Action {
         id: run_id.clone(),
-        session_id: session_id.clone(),
+        session_id,
         parent_id: None,
         kind: "verification:run".to_string(),
-        meta: Some(format!(
-            "{{\"contract_id\":\"{}\",\"phase\":\"{}\"}}",
-            contract_id, phase,
-        )),
+        meta: Some(meta),
         state: "Created".to_string(),
         created_at: now,
     };
     timeline::create_action(conn, &action)?;
+    timeline::start_execution(conn, &action.id)?;
 
-    // start execution
-    let exec_id = timeline::start_execution(conn, &action.id)?;
-
-    // insert verification_runs
+    // receipt_id is deliberately NULL until timeline::finish_execution creates
+    // an actual receipt. The previous implementation stored an execution ID in
+    // this column, corrupting the relationship between verification and evidence.
     conn.execute(
-        "INSERT INTO verification_runs (id, contract_id, phase, status, started_at, receipt_id) VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![run_id, contract_id, phase.to_string(), RunStatus::Running.to_string(), now, exec_id],
+        "INSERT INTO verification_runs (id, contract_id, check_id, phase, status, started_at, receipt_id) VALUES (?1,?2,?3,?4,?5,?6,NULL)",
+        rusqlite::params![run_id, contract_id, check_id, phase.to_string(), RunStatus::Running.to_string(), now],
     )?;
 
     Ok(run_id)
 }
 
-/// Finish a verification run by updating its status and recording receipt_id (receipt_id is expected to be created by timeline.finish_execution and returned by it).
+/// Start a contract-level verification run. Prefer `start_verification_check_run`
+/// for contracts that contain explicit checks.
+pub fn start_verification_run(
+    conn: &Connection,
+    contract_id: &str,
+    phase: RunPhase,
+) -> Result<String> {
+    start_run(conn, contract_id, None, phase)
+}
+
+pub fn start_verification_check_run(
+    conn: &Connection,
+    contract_id: &str,
+    check_id: &str,
+    phase: RunPhase,
+) -> Result<String> {
+    start_run(conn, contract_id, Some(check_id), phase)
+}
+
+fn execution_id_for_run(conn: &Connection, run_id: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT id FROM executions WHERE action_id = ?1 ORDER BY created_seq DESC LIMIT 1",
+        rusqlite::params![run_id],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| VerificationError::RunNotFound(run_id.to_owned()))
+}
+
+fn validate_finish_status(status: RunStatus) -> Result<()> {
+    match status {
+        RunStatus::Passed | RunStatus::Failed | RunStatus::Error | RunStatus::Interrupted => Ok(()),
+        RunStatus::Pending | RunStatus::Running => Err(VerificationError::InvalidFinishStatus(status)),
+    }
+}
+
+fn timeline_status(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Passed => "Succeeded",
+        RunStatus::Failed | RunStatus::Error => "Failed",
+        RunStatus::Interrupted => "Interrupted",
+        RunStatus::Pending => "Pending",
+        RunStatus::Running => "Running",
+    }
+}
+
+/// Finish a verification run and its underlying Timeline execution together.
+/// The returned receipt is the real receipt created by Timeline persistence.
+pub fn finish_verification_run_with_output(
+    conn: &mut Connection,
+    run_id: &str,
+    status: RunStatus,
+    stdout_preview: Option<&str>,
+    stderr_preview: Option<&str>,
+) -> Result<String> {
+    validate_finish_status(status)?;
+    let execution_id = execution_id_for_run(conn, run_id)?;
+    let receipt_id = timeline::finish_execution(
+        conn,
+        &execution_id,
+        timeline_status(status),
+        stdout_preview,
+        stderr_preview,
+    )?;
+    finish_verification_run(conn, run_id, status, &receipt_id)?;
+    Ok(receipt_id)
+}
+
+/// Attach an already-created receipt to a verification run. The receipt must
+/// belong to the Timeline execution created for this run.
 pub fn finish_verification_run(
     conn: &mut Connection,
     run_id: &str,
     status: RunStatus,
     receipt_id: &str,
-) -> Result<(), rusqlite::Error> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    conn.execute(
-        "UPDATE verification_runs SET status = ?1, finished_at = ?2, receipt_id = ?3 WHERE id = ?4",
-        rusqlite::params![status.to_string(), now, receipt_id, run_id],
+) -> Result<()> {
+    validate_finish_status(status)?;
+    let execution_id = execution_id_for_run(conn, run_id)?;
+    let matching_receipt: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM receipts WHERE id = ?1 AND execution_id = ?2",
+            rusqlite::params![receipt_id, execution_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if matching_receipt.is_none() {
+        return Err(VerificationError::ReceiptMismatch {
+            run_id: run_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+        });
+    }
+
+    let now = unix_time_secs()?;
+    let started_at: i64 = conn
+        .query_row(
+            "SELECT started_at FROM verification_runs WHERE id = ?1",
+            rusqlite::params![run_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| VerificationError::RunNotFound(run_id.to_owned()))?;
+    let duration_ms = now.saturating_sub(started_at).saturating_mul(1000);
+    let changed = conn.execute(
+        "UPDATE verification_runs SET status = ?1, finished_at = ?2, duration_ms = ?3, receipt_id = ?4 WHERE id = ?5 AND status = 'Running'",
+        rusqlite::params![status.to_string(), now, duration_ms, receipt_id, run_id],
     )?;
+    if changed != 1 {
+        return Err(VerificationError::RunNotFound(run_id.to_owned()));
+    }
     Ok(())
 }
 
-pub fn evaluate_outcome(conn: &Connection, contract_id: &str) -> Result<String, rusqlite::Error> {
-    // naive evaluation for initial implementation:
-    // if any Before run exists with status Failed -> before_failed
-    // if any After run exists with status Passed and before_failed -> Verified Fix
-    let before_failed: Option<String> = conn.query_row(
-        "SELECT id FROM verification_runs WHERE contract_id = ?1 AND phase = 'Before' AND status = 'Failed' LIMIT 1",
-        rusqlite::params![contract_id],
-        |r| r.get(0),
-    ).optional()?;
+pub fn recover_running_verifications(conn: &mut Connection) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE verification_runs SET status = 'Interrupted', finished_at = COALESCE(finished_at, started_at) WHERE status = 'Running'",
+        [],
+    )?;
+    tx.commit()?;
+    timeline::recover_running(conn)?;
+    Ok(changed)
+}
 
-    if before_failed.is_none() {
-        return Ok("BeforePassedOrNotObserved".to_string());
+fn latest_status(
+    conn: &Connection,
+    contract_id: &str,
+    check_id: &str,
+    phase: RunPhase,
+) -> Result<Option<RunStatus>> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT status FROM verification_runs WHERE contract_id = ?1 AND check_id = ?2 AND phase = ?3 ORDER BY started_at DESC, id DESC LIMIT 1",
+            rusqlite::params![contract_id, check_id, phase.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref().and_then(parse_run_status))
+}
+
+fn evaluate_check(before: Option<RunStatus>, after: Option<RunStatus>) -> OutcomeState {
+    match (before, after) {
+        (Some(RunStatus::Failed), Some(RunStatus::Passed)) => OutcomeState::VerifiedFix,
+        (Some(RunStatus::Passed), _) => OutcomeState::ReproductionNotProven,
+        (Some(RunStatus::Failed), Some(RunStatus::Failed)) => OutcomeState::NotFixed,
+        (Some(RunStatus::Error | RunStatus::Interrupted), _)
+        | (_, Some(RunStatus::Error | RunStatus::Interrupted))
+        | (None, _)
+        | (_, None)
+        | (Some(RunStatus::Pending | RunStatus::Running), _)
+        | (_, Some(RunStatus::Pending | RunStatus::Running)) => OutcomeState::Inconclusive,
+        // BEFORE failed and AFTER has any non-terminal/non-passing state is not
+        // enough evidence to claim a fix.
+        (Some(RunStatus::Failed), Some(RunStatus::Passed)) => OutcomeState::VerifiedFix,
+    }
+}
+
+pub fn evaluate_outcome_state(conn: &Connection, contract_id: &str) -> Result<OutcomeState> {
+    let checks = list_verification_checks(conn, contract_id)?;
+    let required: Vec<_> = checks.into_iter().filter(|check| check.required).collect();
+
+    if required.is_empty() {
+        return Ok(OutcomeState::Inconclusive);
     }
 
-    let after_passed: Option<String> = conn.query_row(
-        "SELECT id FROM verification_runs WHERE contract_id = ?1 AND phase = 'After' AND status = 'Passed' LIMIT 1",
-        rusqlite::params![contract_id],
-        |r| r.get(0),
-    ).optional()?;
+    let mut saw_reproduction_not_proven = false;
+    let mut saw_inconclusive = false;
+    for check in required {
+        let before = latest_status(conn, contract_id, &check.id, RunPhase::Before)?;
+        let after = latest_status(conn, contract_id, &check.id, RunPhase::After)?;
+        match evaluate_check(before, after) {
+            OutcomeState::NotFixed => return Ok(OutcomeState::NotFixed),
+            OutcomeState::ReproductionNotProven => saw_reproduction_not_proven = true,
+            OutcomeState::Inconclusive => saw_inconclusive = true,
+            OutcomeState::VerifiedFix => {}
+        }
+    }
 
-    if after_passed.is_some() {
-        Ok("VerifiedFix".to_string())
+    if saw_reproduction_not_proven {
+        Ok(OutcomeState::ReproductionNotProven)
+    } else if saw_inconclusive {
+        Ok(OutcomeState::Inconclusive)
     } else {
-        Ok("NotFixed".to_string())
+        Ok(OutcomeState::VerifiedFix)
     }
+}
+
+pub fn evaluate_outcome(conn: &Connection, contract_id: &str) -> Result<String> {
+    Ok(evaluate_outcome_state(conn, contract_id)?.to_string())
 }
 
 #[cfg(test)]
@@ -214,52 +469,188 @@ mod tests {
     use crate::db::init_db;
     use tempfile::NamedTempFile;
 
+    fn setup() -> (NamedTempFile, Connection, OutcomeContract, VerificationCheck) {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut conn = init_db(tmp.path()).expect("init db");
+        conn.execute(
+            "INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params!["s-test", "r", 1, 1, "Active"],
+        )
+        .unwrap();
+        let contract = create_outcome_contract(&conn, "s-test", "T", Some("d")).unwrap();
+        let check = add_verification_check(
+            &conn,
+            &contract.id,
+            "check-1",
+            "Regression test",
+            Some("cargo test"),
+            Some("exit 0"),
+            true,
+            0,
+        )
+        .unwrap();
+        (tmp, conn, contract, check)
+    }
+
+    fn complete(
+        conn: &mut Connection,
+        contract: &OutcomeContract,
+        check: &VerificationCheck,
+        phase: RunPhase,
+        status: RunStatus,
+    ) -> String {
+        let run = start_verification_check_run(conn, &contract.id, &check.id, phase).unwrap();
+        finish_verification_run_with_output(conn, &run, status, Some("verification output"), None)
+            .unwrap();
+        run
+    }
+
     #[test]
     fn create_and_query_contract() {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let conn = init_db(path).expect("init db");
-
-        // create minimal session required by FK
-        conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-test","r",1,1,"Active"]).unwrap();
-
-        let c = create_outcome_contract(&conn, "s-test", "T", Some("d")).expect("create");
-        let got = get_outcome_contract(&conn, &c.id)
+        let (_tmp, conn, contract, _check) = setup();
+        let got = get_outcome_contract(&conn, &contract.id)
             .expect("get")
             .expect("found");
         assert_eq!(got.title, "T");
     }
 
     #[test]
-    fn start_and_finish_run_lifecycle() {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let mut conn = init_db(path).expect("init db");
+    fn start_and_finish_run_lifecycle_uses_real_receipt() {
+        let (_tmp, mut conn, contract, check) = setup();
+        let run_id =
+            start_verification_check_run(&conn, &contract.id, &check.id, RunPhase::Before)
+                .expect("start");
 
-        conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-r","r",1,1,"Active"]).unwrap();
-        let c = create_outcome_contract(&conn, "s-r", "title", None).unwrap();
-
-        let run_id = start_verification_run(&conn, &c.id, RunPhase::Before).expect("start");
-        // there should be a verification_runs row
-        let status: String = conn
+        let (status, receipt_at_start): (String, Option<String>) = conn
             .query_row(
-                "SELECT status FROM verification_runs WHERE id = ?1",
+                "SELECT status, receipt_id FROM verification_runs WHERE id = ?1",
                 rusqlite::params![&run_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(status, "Running");
+        assert!(receipt_at_start.is_none());
 
-        // simulate finishing by calling finish_verification_run
-        finish_verification_run(&mut conn, &run_id, RunStatus::Passed, "receipt-x")
-            .expect("finish");
-        let status2: String = conn
+        let receipt = finish_verification_run_with_output(
+            &mut conn,
+            &run_id,
+            RunStatus::Failed,
+            Some("failure"),
+            None,
+        )
+        .unwrap();
+
+        let (run_status, stored_receipt): (String, Option<String>) = conn
             .query_row(
-                "SELECT status FROM verification_runs WHERE id = ?1",
+                "SELECT status, receipt_id FROM verification_runs WHERE id = ?1",
+                rusqlite::params![&run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "Failed");
+        assert_eq!(stored_receipt.as_deref(), Some(receipt.as_str()));
+
+        let execution_status: String = conn
+            .query_row(
+                "SELECT status FROM executions WHERE action_id = ?1",
                 rusqlite::params![&run_id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status2, "Passed");
+        assert_eq!(execution_status, "Failed");
+    }
+
+    #[test]
+    fn before_failed_after_passed_is_verified_fix() {
+        let (_tmp, mut conn, contract, check) = setup();
+        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Failed);
+        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        assert_eq!(
+            evaluate_outcome_state(&conn, &contract.id).unwrap(),
+            OutcomeState::VerifiedFix
+        );
+    }
+
+    #[test]
+    fn before_passed_means_reproduction_not_proven() {
+        let (_tmp, mut conn, contract, check) = setup();
+        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Passed);
+        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        assert_eq!(
+            evaluate_outcome_state(&conn, &contract.id).unwrap(),
+            OutcomeState::ReproductionNotProven
+        );
+    }
+
+    #[test]
+    fn before_failed_after_failed_is_not_fixed() {
+        let (_tmp, mut conn, contract, check) = setup();
+        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Failed);
+        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Failed);
+        assert_eq!(
+            evaluate_outcome_state(&conn, &contract.id).unwrap(),
+            OutcomeState::NotFixed
+        );
+    }
+
+    #[test]
+    fn error_or_interruption_is_inconclusive() {
+        let (_tmp, mut conn, contract, check) = setup();
+        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Error);
+        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        assert_eq!(
+            evaluate_outcome_state(&conn, &contract.id).unwrap(),
+            OutcomeState::Inconclusive
+        );
+    }
+
+    #[test]
+    fn different_checks_cannot_prove_each_other() {
+        let (_tmp, mut conn, contract, check_a) = setup();
+        let check_b = add_verification_check(
+            &conn,
+            &contract.id,
+            "check-2",
+            "Second regression check",
+            None,
+            None,
+            true,
+            1,
+        )
+        .unwrap();
+
+        complete(&mut conn, &contract, &check_a, RunPhase::Before, RunStatus::Failed);
+        complete(&mut conn, &contract, &check_b, RunPhase::After, RunStatus::Passed);
+
+        assert_eq!(
+            evaluate_outcome_state(&conn, &contract.id).unwrap(),
+            OutcomeState::Inconclusive
+        );
+    }
+
+    #[test]
+    fn recovery_interrupts_verification_and_timeline_execution() {
+        let (_tmp, mut conn, contract, check) = setup();
+        let run = start_verification_check_run(&conn, &contract.id, &check.id, RunPhase::Before)
+            .unwrap();
+        assert_eq!(recover_running_verifications(&mut conn).unwrap(), 1);
+
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM verification_runs WHERE id = ?1",
+                rusqlite::params![run],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_status, "Interrupted");
+
+        let execution_status: String = conn
+            .query_row(
+                "SELECT status FROM executions WHERE action_id = ?1",
+                rusqlite::params![run],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(execution_status, "Interrupted");
     }
 }
