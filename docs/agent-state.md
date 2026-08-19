@@ -11,6 +11,9 @@ Resume from the actual workspace, current git diff, active OpenSpec change, and 
 ## Completed
 - Preserve existing completed work here as it is verified.
 
+## Baseline commit
+- Core Foundation baseline commit SHA: 596016fc883dceb34e5fe58acee349d56551c1ab
+
 ## Next exact actions
 1. Inspect current git diff and unresolved audit findings.
 2. Fix the highest-severity unblocked issue.
