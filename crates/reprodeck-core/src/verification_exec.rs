@@ -36,6 +36,9 @@ pub struct VerificationExecutionRequest {
     pub phase: RunPhase,
     pub spec: CommandSpec,
     pub configured_permission: Permission,
+    /// True only for a single command the user has just approved in an Ask
+    /// prompt. It never bypasses configured Deny or verification hard-denies.
+    pub explicitly_approved_once: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,9 +74,10 @@ fn parse_expected_exit_code(condition: Option<&str>) -> Result<i32> {
 
     let lower = condition.to_ascii_lowercase();
     if let Some(value) = lower.strip_prefix("exit ") {
-        return value.trim().parse::<i32>().map_err(|_| {
-            VerificationExecutionError::UnsupportedExpectedCondition(condition.into())
-        });
+        return value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| VerificationExecutionError::UnsupportedExpectedCondition(condition.into()));
     }
 
     let compact: String = lower.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -192,10 +196,11 @@ pub fn execute_verification_check(
     let check = get_check(conn, &request.contract_id, &request.check_id)?;
     let expected_exit_code = parse_expected_exit_code(check.expected_condition.as_deref())?;
 
-    let decision = permissions::verification_command_permission(
+    let decision = permissions::verification_command_permission_with_approval(
         &request.spec.executable,
         &request.spec.args,
         request.configured_permission,
+        request.explicitly_approved_once,
     );
     match decision.permission {
         Permission::Deny => {
@@ -353,6 +358,7 @@ mod tests {
             phase,
             spec,
             configured_permission: permission,
+            explicitly_approved_once: false,
         }
     }
 
@@ -424,6 +430,29 @@ mod tests {
             Err(VerificationExecutionError::DecisionRequired { .. })
         ));
         assert_eq!(run_count(&conn), 0);
+    }
+
+    #[test]
+    fn one_shot_approval_satisfies_ask_and_creates_run() {
+        let (_db, mut conn, contract, check) = setup();
+        let storage = tempdir().unwrap();
+        let mut request = request(
+            &contract,
+            &check,
+            RunPhase::Before,
+            git_spec(&["--version"]),
+            Permission::Ask,
+        );
+        request.explicitly_approved_once = true;
+        let outcome = execute_verification_check(
+            &mut conn,
+            storage.path(),
+            request,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert_eq!(run_count(&conn), 1);
     }
 
     #[test]
@@ -537,24 +566,26 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_git_mutation_requires_approval_even_when_configured_allow() {
+    fn mutating_git_is_hard_denied_from_verification() {
         let (_db, mut conn, contract, check) = setup();
         let storage = tempdir().unwrap();
+        let mut request = request(
+            &contract,
+            &check,
+            RunPhase::Before,
+            git_spec(&["push"]),
+            Permission::Allow,
+        );
+        request.explicitly_approved_once = true;
         let result = execute_verification_check(
             &mut conn,
             storage.path(),
-            request(
-                &contract,
-                &check,
-                RunPhase::Before,
-                git_spec(&["push"]),
-                Permission::Allow,
-            ),
+            request,
             None,
         );
         assert!(matches!(
             result,
-            Err(VerificationExecutionError::DecisionRequired { .. })
+            Err(VerificationExecutionError::PermissionDenied { .. })
         ));
         assert_eq!(run_count(&conn), 0);
     }
