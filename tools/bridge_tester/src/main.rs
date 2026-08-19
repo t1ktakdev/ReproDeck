@@ -1,11 +1,14 @@
-use reprodeck_lib::*;
+use reprodeck_lib::list_sessions_service;
 
 fn main() {
-    match list_sessions() {
-        Ok(v) => println!(
-            "list_sessions ok: {}",
-            serde_json::to_string_pretty(&v).unwrap()
+    match list_sessions_service() {
+        Ok(sessions) => println!(
+            "list_sessions_service ok: {}",
+            serde_json::to_string_pretty(&sessions).expect("serialize sessions")
         ),
-        Err(e) => println!("list_sessions err: {}", e),
+        Err(error) => {
+            eprintln!("list_sessions_service error: {error}");
+            std::process::exit(1);
+        }
     }
 }
