@@ -370,16 +370,23 @@ mod tests {
     fn fresh_db_applies_all_migrations() {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).unwrap();
-        assert_eq!(get_db_schema_version(&conn).unwrap(), current_migration_version());
+        assert_eq!(
+            get_db_schema_version(&conn).unwrap(),
+            current_migration_version()
+        );
     }
 
     #[test]
     fn pragmas_and_foreign_keys_enabled() {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).unwrap();
-        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys;", [], |row| row.get(0)).unwrap();
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(foreign_keys, 1);
-        let journal_mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0)).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
         assert!(journal_mode.eq_ignore_ascii_case("wal"));
     }
 
@@ -398,7 +405,10 @@ mod tests {
         tx.commit().unwrap();
 
         let conn = init_db(tmp.path()).unwrap();
-        assert_eq!(get_db_schema_version(&conn).unwrap(), current_migration_version());
+        assert_eq!(
+            get_db_schema_version(&conn).unwrap(),
+            current_migration_version()
+        );
     }
 
     #[test]
@@ -418,7 +428,10 @@ mod tests {
             params!["999"],
         )
         .unwrap();
-        assert!(matches!(init_db(tmp.path()), Err(MigrationError::UnknownSchemaVersion(_))));
+        assert!(matches!(
+            init_db(tmp.path()),
+            Err(MigrationError::UnknownSchemaVersion(_))
+        ));
     }
 
     #[test]
@@ -431,7 +444,10 @@ mod tests {
             params!["not-a-number"],
         )
         .unwrap();
-        assert!(matches!(init_db(tmp.path()), Err(MigrationError::MigrationFailed(_))));
+        assert!(matches!(
+            init_db(tmp.path()),
+            Err(MigrationError::MigrationFailed(_))
+        ));
     }
 
     #[test]
@@ -446,7 +462,9 @@ mod tests {
         .unwrap();
         let mut conn = Connection::open(tmp.path()).unwrap();
         let tx = conn.transaction().unwrap();
-        assert!(tx.execute_batch("CREATE TABLE test_temp(id INTEGER); INVALID SQL;").is_err());
+        assert!(tx
+            .execute_batch("CREATE TABLE test_temp(id INTEGER); INVALID SQL;")
+            .is_err());
         drop(tx);
         assert_eq!(get_db_schema_version(&conn).unwrap(), 1);
     }
@@ -514,8 +532,13 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).unwrap();
         seed_session_and_contract(&conn);
-        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM outcome_contracts", [], |row| row.get(0)).unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outcome_contracts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(count, 0);
     }
 }

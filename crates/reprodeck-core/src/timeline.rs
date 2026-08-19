@@ -133,9 +133,7 @@ fn long_token_regex() -> &'static Regex {
 }
 
 fn sanitize_preview(input: &str) -> String {
-    let mut value = bearer_regex()
-        .replace_all(input, "[REDACTED]")
-        .into_owned();
+    let mut value = bearer_regex().replace_all(input, "[REDACTED]").into_owned();
     value = key_value_regex()
         .replace_all(&value, "$1=[REDACTED]")
         .into_owned();
@@ -409,7 +407,8 @@ pub fn finish_execution(
     stderr_preview: Option<&str>,
 ) -> Result<String, TimelineError> {
     let tx = conn.transaction()?;
-    let receipt_id = finish_execution_in_transaction(&tx, execution_id, status, stdout_preview, stderr_preview)?;
+    let receipt_id =
+        finish_execution_in_transaction(&tx, execution_id, status, stdout_preview, stderr_preview)?;
     tx.commit()?;
     Ok(receipt_id)
 }
@@ -527,7 +526,8 @@ mod tests {
             create_action(&conn, &action(&format!("a-{i}"), "s-pag")).unwrap();
         }
         let first = list_actions(&conn, "s-pag", None, 2).unwrap();
-        let second = list_actions(&conn, "s-pag", Some(first.last().unwrap().created_seq), 10).unwrap();
+        let second =
+            list_actions(&conn, "s-pag", Some(first.last().unwrap().created_seq), 10).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 3);
         assert!(first.iter().all(|a| second.iter().all(|b| a.id != b.id)));
@@ -537,8 +537,14 @@ mod tests {
     fn invalid_pagination_limit_rejected() {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).unwrap();
-        assert!(matches!(list_sessions(&conn, None, 0), Err(TimelineError::InvalidLimit)));
-        assert!(matches!(list_sessions(&conn, None, 501), Err(TimelineError::InvalidLimit)));
+        assert!(matches!(
+            list_sessions(&conn, None, 0),
+            Err(TimelineError::InvalidLimit)
+        ));
+        assert!(matches!(
+            list_sessions(&conn, None, 501),
+            Err(TimelineError::InvalidLimit)
+        ));
     }
 
     #[test]
@@ -548,7 +554,14 @@ mod tests {
         setup_session(&conn, "s-roundtrip");
         create_action(&conn, &action("a-roundtrip", "s-roundtrip")).unwrap();
         let execution_id = start_execution(&conn, "a-roundtrip").unwrap();
-        let receipt_id = finish_execution(&mut conn, &execution_id, "Succeeded", Some("hello"), Some("warning")).unwrap();
+        let receipt_id = finish_execution(
+            &mut conn,
+            &execution_id,
+            "Succeeded",
+            Some("hello"),
+            Some("warning"),
+        )
+        .unwrap();
         let execution = get_execution(&conn, &execution_id).unwrap().unwrap();
         let receipt = get_receipt(&conn, &receipt_id).unwrap().unwrap();
         assert_eq!(execution.status, "Succeeded");
@@ -565,7 +578,10 @@ mod tests {
         create_action(&conn, &action("a-double", "s-double")).unwrap();
         let execution_id = start_execution(&conn, "a-double").unwrap();
         finish_execution(&mut conn, &execution_id, "Succeeded", None, None).unwrap();
-        assert!(matches!(finish_execution(&mut conn, &execution_id, "Succeeded", None, None), Err(TimelineError::ExecutionNotFound(_))));
+        assert!(matches!(
+            finish_execution(&mut conn, &execution_id, "Succeeded", None, None),
+            Err(TimelineError::ExecutionNotFound(_))
+        ));
     }
 
     #[test]
@@ -575,8 +591,19 @@ mod tests {
         create_session(&conn, "s-sec", "Active", None).unwrap();
         create_action(&conn, &action("asec", "s-sec")).unwrap();
         let execution_id = start_execution(&conn, "asec").unwrap();
-        let receipt_id = finish_execution(&mut conn, &execution_id, "Succeeded", Some("Bearer abcdef12345== password=hunter2"), None).unwrap();
-        let preview = get_receipt(&conn, &receipt_id).unwrap().unwrap().stdout_preview.unwrap();
+        let receipt_id = finish_execution(
+            &mut conn,
+            &execution_id,
+            "Succeeded",
+            Some("Bearer abcdef12345== password=hunter2"),
+            None,
+        )
+        .unwrap();
+        let preview = get_receipt(&conn, &receipt_id)
+            .unwrap()
+            .unwrap()
+            .stdout_preview
+            .unwrap();
         assert!(!preview.contains("abcdef12345"));
         assert!(!preview.contains("hunter2"));
         assert!(preview.contains("REDACTED"));
@@ -592,8 +619,13 @@ mod tests {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature";
         let aws = format!("AKIA{}", "A".repeat(16));
         let input = format!("start {jwt} middle {aws} end");
-        let receipt_id = finish_execution(&mut conn, &execution_id, "Succeeded", Some(&input), None).unwrap();
-        let preview = get_receipt(&conn, &receipt_id).unwrap().unwrap().stdout_preview.unwrap();
+        let receipt_id =
+            finish_execution(&mut conn, &execution_id, "Succeeded", Some(&input), None).unwrap();
+        let preview = get_receipt(&conn, &receipt_id)
+            .unwrap()
+            .unwrap()
+            .stdout_preview
+            .unwrap();
         assert!(!preview.contains("eyJhbGci"));
         assert!(!preview.contains("AKIA"));
     }
@@ -606,7 +638,8 @@ mod tests {
         create_action(&conn, &action("a-unicode", "s-unicode")).unwrap();
         let execution_id = start_execution(&conn, "a-unicode").unwrap();
         let output = format!("{}{}", "😀".repeat(300), "русский-текст".repeat(50));
-        let receipt_id = finish_execution(&mut conn, &execution_id, "Succeeded", Some(&output), None).unwrap();
+        let receipt_id =
+            finish_execution(&mut conn, &execution_id, "Succeeded", Some(&output), None).unwrap();
         let receipt = get_receipt(&conn, &receipt_id).unwrap().unwrap();
         let preview = receipt.stdout_preview.unwrap();
         assert!(preview.len() <= 1024);
@@ -620,7 +653,11 @@ mod tests {
         let conn = init_db(tmp.path()).unwrap();
         create_session(&conn, "s-123", "Active", Some("{}")).unwrap();
         create_action(&conn, &action("act-2", "s-123")).unwrap();
-        conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params!["s-123"]).unwrap();
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params!["s-123"],
+        )
+        .unwrap();
         assert!(get_action(&conn, "act-2").unwrap().is_none());
     }
 

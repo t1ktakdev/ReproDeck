@@ -195,7 +195,19 @@ fn check_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VerificationCheck
     })
 }
 
-fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, Option<String>, String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>)> {
+fn run_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+)> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -210,7 +222,17 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, Op
 }
 
 fn decode_run(
-    raw: (String, String, Option<String>, String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>),
+    raw: (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    ),
 ) -> Result<VerificationRun> {
     Ok(VerificationRun {
         id: raw.0,
@@ -309,10 +331,7 @@ pub fn add_verification_check(
     })
 }
 
-pub fn update_verification_check(
-    conn: &Connection,
-    check: &VerificationCheck,
-) -> Result<()> {
+pub fn update_verification_check(conn: &Connection, check: &VerificationCheck) -> Result<()> {
     let changed = conn.execute(
         "UPDATE verification_checks SET stable_id = ?1, description = ?2, command_ref = ?3, expected_condition = ?4, required = ?5, ordering = ?6 WHERE id = ?7 AND contract_id = ?8",
         rusqlite::params![
@@ -415,10 +434,7 @@ pub fn start_verification_check_run(
     start_run(conn, contract_id, Some(check_id), phase)
 }
 
-pub fn get_verification_run(
-    conn: &Connection,
-    run_id: &str,
-) -> Result<Option<VerificationRun>> {
+pub fn get_verification_run(conn: &Connection, run_id: &str) -> Result<Option<VerificationRun>> {
     let raw = conn
         .query_row(
             "SELECT id, contract_id, check_id, phase, status, started_at, finished_at, duration_ms, receipt_id FROM verification_runs WHERE id = ?1",
@@ -455,7 +471,9 @@ fn execution_id_for_run(conn: &Connection, run_id: &str) -> Result<String> {
 fn validate_finish_status(status: RunStatus) -> Result<()> {
     match status {
         RunStatus::Passed | RunStatus::Failed | RunStatus::Error | RunStatus::Interrupted => Ok(()),
-        RunStatus::Pending | RunStatus::Running => Err(VerificationError::InvalidFinishStatus(status)),
+        RunStatus::Pending | RunStatus::Running => {
+            Err(VerificationError::InvalidFinishStatus(status))
+        }
     }
 }
 
@@ -594,7 +612,9 @@ fn evaluate_check(before: Option<RunStatus>, after: Option<RunStatus>) -> Outcom
             Some(RunStatus::Failed) => OutcomeState::NotFixed,
             _ => OutcomeState::Inconclusive,
         },
-        Some(RunStatus::Pending | RunStatus::Running | RunStatus::Error | RunStatus::Interrupted)
+        Some(
+            RunStatus::Pending | RunStatus::Running | RunStatus::Error | RunStatus::Interrupted,
+        )
         | None => OutcomeState::Inconclusive,
     }
 }
@@ -614,8 +634,10 @@ pub fn get_outcome_summary(conn: &Connection, contract_id: &str) -> Result<Outco
         });
     }
 
-    let required: Vec<&VerificationCheckSummary> =
-        summaries.iter().filter(|item| item.check.required).collect();
+    let required: Vec<&VerificationCheckSummary> = summaries
+        .iter()
+        .filter(|item| item.check.required)
+        .collect();
     let overall = if required.is_empty() {
         OutcomeState::Inconclusive
     } else if required
@@ -658,7 +680,12 @@ mod tests {
     use crate::db::init_db;
     use tempfile::NamedTempFile;
 
-    fn setup() -> (NamedTempFile, Connection, OutcomeContract, VerificationCheck) {
+    fn setup() -> (
+        NamedTempFile,
+        Connection,
+        OutcomeContract,
+        VerificationCheck,
+    ) {
         let tmp = NamedTempFile::new().unwrap();
         let conn = init_db(tmp.path()).unwrap();
         conn.execute(
@@ -701,7 +728,9 @@ mod tests {
         assert_eq!(got.title, "T");
         let contracts = list_outcome_contracts(&conn, Some("s-test")).unwrap();
         assert_eq!(contracts, vec![contract]);
-        assert!(list_outcome_contracts(&conn, Some("other")).unwrap().is_empty());
+        assert!(list_outcome_contracts(&conn, Some("other"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -729,13 +758,9 @@ mod tests {
     #[test]
     fn start_and_finish_run_lifecycle_uses_real_receipt() {
         let (_tmp, mut conn, contract, check) = setup();
-        let run_id = start_verification_check_run(
-            &mut conn,
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-        )
-        .unwrap();
+        let run_id =
+            start_verification_check_run(&mut conn, &contract.id, &check.id, RunPhase::Before)
+                .unwrap();
         let running = get_verification_run(&conn, &run_id).unwrap().unwrap();
         assert_eq!(running.status, RunStatus::Running);
         assert!(running.receipt_id.is_none());
@@ -754,12 +779,13 @@ mod tests {
         assert_eq!(
             timeline::get_execution(
                 &conn,
-                &conn.query_row(
-                    "SELECT id FROM executions WHERE action_id = ?1",
-                    rusqlite::params![&run_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
+                &conn
+                    .query_row(
+                        "SELECT id FROM executions WHERE action_id = ?1",
+                        rusqlite::params![&run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
             )
             .unwrap()
             .unwrap()
@@ -771,8 +797,20 @@ mod tests {
     #[test]
     fn before_failed_after_passed_is_verified_fix() {
         let (_tmp, mut conn, contract, check) = setup();
-        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
         let summary = get_outcome_summary(&conn, &contract.id).unwrap();
         assert_eq!(summary.overall, OutcomeState::VerifiedFix);
         assert_eq!(summary.checks[0].before, Some(RunStatus::Failed));
@@ -782,8 +820,20 @@ mod tests {
     #[test]
     fn before_passed_means_reproduction_not_proven() {
         let (_tmp, mut conn, contract, check) = setup();
-        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Passed);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::Before,
+            RunStatus::Passed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::ReproductionNotProven
@@ -793,8 +843,20 @@ mod tests {
     #[test]
     fn before_failed_after_failed_is_not_fixed() {
         let (_tmp, mut conn, contract, check) = setup();
-        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Failed);
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Failed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::NotFixed
@@ -804,8 +866,20 @@ mod tests {
     #[test]
     fn error_or_interruption_is_inconclusive() {
         let (_tmp, mut conn, contract, check) = setup();
-        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Error);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::Before,
+            RunStatus::Error,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::Inconclusive
@@ -826,10 +900,34 @@ mod tests {
             1,
         )
         .unwrap();
-        complete(&mut conn, &contract, &required, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &required, RunPhase::After, RunStatus::Passed);
-        complete(&mut conn, &contract, &optional, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &optional, RunPhase::After, RunStatus::Failed);
+        complete(
+            &mut conn,
+            &contract,
+            &required,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &required,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &optional,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &optional,
+            RunPhase::After,
+            RunStatus::Failed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::VerifiedFix
@@ -850,8 +948,20 @@ mod tests {
             1,
         )
         .unwrap();
-        complete(&mut conn, &contract, &check_a, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &check_b, RunPhase::After, RunStatus::Passed);
+        complete(
+            &mut conn,
+            &contract,
+            &check_a,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check_b,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::Inconclusive
@@ -861,9 +971,27 @@ mod tests {
     #[test]
     fn latest_run_wins_deterministically() {
         let (_tmp, mut conn, contract, check) = setup();
-        complete(&mut conn, &contract, &check, RunPhase::Before, RunStatus::Failed);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Failed);
-        complete(&mut conn, &contract, &check, RunPhase::After, RunStatus::Passed);
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::Before,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Failed,
+        );
+        complete(
+            &mut conn,
+            &contract,
+            &check,
+            RunPhase::After,
+            RunStatus::Passed,
+        );
         assert_eq!(
             evaluate_outcome_state(&conn, &contract.id).unwrap(),
             OutcomeState::VerifiedFix
@@ -876,13 +1004,9 @@ mod tests {
     #[test]
     fn recovery_interrupts_only_verification_timeline_executions() {
         let (_tmp, mut conn, contract, check) = setup();
-        let run = start_verification_check_run(
-            &mut conn,
-            &contract.id,
-            &check.id,
-            RunPhase::Before,
-        )
-        .unwrap();
+        let run =
+            start_verification_check_run(&mut conn, &contract.id, &check.id, RunPhase::Before)
+                .unwrap();
 
         let unrelated_action = timeline::Action {
             id: "unrelated-action".to_string(),
