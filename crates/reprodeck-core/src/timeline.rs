@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use regex::Regex;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Action {
@@ -69,8 +70,44 @@ pub fn finish_execution(conn: &mut Connection, execution_id: &str, status: &str,
 
     // insert receipt
     let receipt_id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO receipts (id, execution_id, summary, stdout_preview, stderr_preview, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![receipt_id, execution_id, "", stdout_preview, stderr_preview, now])?;
+    // sanitize then apply preview bounding
+    fn sanitize_preview(input: &str) -> String {
+        // redact bearer tokens
+        let bearer = Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*").unwrap();
+        let mut s = bearer.replace_all(input, "[REDACTED]").into_owned();
+        // redact common key=val patterns for token/password
+        let kv = Regex::new(r"(?i)(password|token|secret)\s*[=:]\s*[^\s,;]+").unwrap();
+        s = kv.replace_all(&s, "$1=[REDACTED]").into_owned();
+        s
+    }
+
+    // apply preview bounding
+    const MAX_PREVIEW: usize = 1024;
+    let (sp_owned, spt) = match stdout_preview {
+        Some(s) => {
+            let san = sanitize_preview(s);
+            if san.len() > MAX_PREVIEW {
+                (Some(san[..MAX_PREVIEW].to_string()), 1)
+            } else {
+                (Some(san), 0)
+            }
+        }
+        None => (None, 0),
+    };
+    let (ep_owned, ept) = match stderr_preview {
+        Some(s) => {
+            let san = sanitize_preview(s);
+            if san.len() > MAX_PREVIEW {
+                (Some(san[..MAX_PREVIEW].to_string()), 1)
+            } else {
+                (Some(san), 0)
+            }
+        }
+        None => (None, 0),
+    };
+
+    tx.execute("INSERT INTO receipts (id, execution_id, summary, stdout_preview, stderr_preview, stdout_truncated, stderr_truncated, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![receipt_id, execution_id, "", sp_owned, ep_owned, spt, ept, now])?;
 
     tx.commit()?;
     Ok(receipt_id)
@@ -116,6 +153,42 @@ mod tests {
         let row = rows.next().unwrap().unwrap();
         let id: String = row.get(0).unwrap();
         assert_eq!(id, "act-1");
+    }
+
+    #[test]
+    fn duplicate_uuid_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let conn = crate::db::init_db(path).expect("init db");
+        // insert session with duplicate id
+        conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",1,1,"Active"]).unwrap();
+        let res = conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",2,2,"Active"]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn action_ordering_and_pagination() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let conn = crate::db::init_db(path).expect("init db");
+        conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-pag","r",1,1,"Active"]).unwrap();
+
+        // insert multiple actions with same created_at
+        for i in 0..5 {
+            let id = format!("a-{}", i);
+            conn.execute("INSERT INTO actions(id, session_id, kind, state, created_at) VALUES (?1,?2,?3,?4,?5)", rusqlite::params![id, "s-pag", "k", "Created", 1000]).unwrap();
+        }
+
+        // pagination by created_seq stable ordering
+        let mut stmt = conn.prepare("SELECT id FROM actions WHERE session_id = ?1 ORDER BY created_seq LIMIT 2") .unwrap();
+        let rows = stmt.query_map(rusqlite::params!["s-pag"], |r| r.get::<_,String>(0)).unwrap();
+        let mut ids: Vec<String> = rows.map(|r| r.unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        // next page
+        let mut stmt2 = conn.prepare("SELECT id FROM actions WHERE session_id = ?1 AND created_seq > (SELECT created_seq FROM actions WHERE id = ?2) ORDER BY created_seq LIMIT 10").unwrap();
+        let rows2 = stmt2.query_map(rusqlite::params!["s-pag", ids.last().unwrap()], |r| r.get::<_,String>(0)).unwrap();
+        let ids2: Vec<String> = rows2.map(|r| r.unwrap()).collect();
+        assert!(ids2.len() >= 1);
     }
 
     #[test]

@@ -124,6 +124,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
             summary TEXT,
             stdout_preview TEXT,
             stderr_preview TEXT,
+            stdout_truncated INTEGER DEFAULT 0,
+            stderr_truncated INTEGER DEFAULT 0,
             created_at INTEGER NOT NULL,
             FOREIGN KEY(execution_id) REFERENCES executions(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
