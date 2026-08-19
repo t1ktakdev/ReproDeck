@@ -1,80 +1,115 @@
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
-pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
-    // compute checksum
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let checksum = hex::encode(hasher.finalize());
+fn is_symlink_or_reparse(path: &Path) -> std::io::Result<bool> {
+    let meta = fs::symlink_metadata(path)?;
+    let mut is_bad = meta.file_type().is_symlink();
 
-    // two-level directory by first two chars
-    if checksum.len() < 2 {
-        return Err(std::io::Error::other("checksum too short"));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            is_bad = true;
+        }
     }
 
-    // canonicalize storage root
+    Ok(is_bad)
+}
+
+fn verify_existing_artifact(path: &Path, expected_checksum: &str, expected_size: usize) -> std::io::Result<()> {
+    if is_symlink_or_reparse(path)? {
+        return Err(std::io::Error::other(
+            "artifact final path is a symlink or reparse point",
+        ));
+    }
+
+    let bytes = fs::read(path)?;
+    if bytes.len() != expected_size {
+        return Err(std::io::Error::other(
+            "artifact store integrity mismatch: existing size differs",
+        ));
+    }
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if actual != expected_checksum {
+        return Err(std::io::Error::other(
+            "artifact store integrity mismatch: existing checksum differs",
+        ));
+    }
+    Ok(())
+}
+
+pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(String, PathBuf)> {
+    fs::create_dir_all(storage_dir)?;
     let base = storage_dir.canonicalize()?;
-    let prefix = &checksum[0..2];
+
+    let checksum = hex::encode(Sha256::digest(data));
+    let prefix = checksum
+        .get(0..2)
+        .ok_or_else(|| std::io::Error::other("checksum too short"))?;
     let dir = storage_dir.join(prefix);
 
-    // If an attacker pre-created a symlink or reparse point at dir, refuse to proceed.
-    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-        // On Unix, file_type().is_symlink() detects symlinks.
-        let mut is_bad = meta.file_type().is_symlink();
-        // On Windows, also treat reparse points/junctions as unsafe (FILE_ATTRIBUTE_REPARSE_POINT = 0x400).
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                is_bad = true;
-            }
-        }
-        if is_bad {
-            return Err(std::io::Error::other(
-                "artifact storage prefix is a symlink or reparse point",
-            ));
-        }
+    if dir.exists() && is_symlink_or_reparse(&dir)? {
+        return Err(std::io::Error::other(
+            "artifact storage prefix is a symlink or reparse point",
+        ));
     }
 
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!("{}.tmp", checksum));
-    let finalp = dir.join(&checksum);
+    let dir_canon = dir.canonicalize()?;
+    if !dir_canon.starts_with(&base) {
+        return Err(std::io::Error::other(
+            "artifact dir canonicalization outside storage root",
+        ));
+    }
 
-    // write to tmp
-    match fs::write(&tmp, data) {
+    let finalp = dir.join(&checksum);
+    if finalp.exists() {
+        verify_existing_artifact(&finalp, &checksum, data.len())?;
+        return Ok((checksum, finalp));
+    }
+
+    // A unique temp name avoids concurrent writers clobbering each other's
+    // temporary file before the final content-addressed rename.
+    let tmp = dir.join(format!("{}.{}.tmp", checksum, Uuid::new_v4()));
+    if let Err(e) = fs::write(&tmp, data) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Re-check containment after the temporary write and before rename.
+    let current_dir_canon = dir.canonicalize()?;
+    if current_dir_canon != dir_canon || !current_dir_canon.starts_with(&base) {
+        let _ = fs::remove_file(&tmp);
+        return Err(std::io::Error::other(
+            "artifact directory changed or escaped storage root",
+        ));
+    }
+
+    match fs::rename(&tmp, &finalp) {
         Ok(()) => {}
+        Err(e) if finalp.exists() => {
+            // Another writer may have won the race. Accept it only if the
+            // existing content matches the content-addressed identity.
+            let _ = fs::remove_file(&tmp);
+            verify_existing_artifact(&finalp, &checksum, data.len())?;
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
     }
 
-    // Re-check containment before rename to mitigate TOCTOU where possible
-    let dir_canon = dir.canonicalize()?;
-    if !dir_canon.starts_with(&base) {
-        let _ = fs::remove_file(&tmp);
-        return Err(std::io::Error::other(
-            "artifact dir canonicalization outside storage root",
-        ));
-    }
-
-    // atomic rename into final path
-    if let Err(e) = fs::rename(&tmp, &finalp) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Verify final path containment
     let final_canon = finalp.canonicalize()?;
     if !final_canon.starts_with(&base) {
-        // attempt to remove the file we just created
         let _ = fs::remove_file(&finalp);
         return Err(std::io::Error::other(
             "artifact stored outside storage root",
         ));
     }
+    verify_existing_artifact(&finalp, &checksum, data.len())?;
 
     Ok((checksum, finalp))
 }
@@ -101,8 +136,8 @@ mod tests {
         let (checksum, path) = store_artifact(dir.path(), b"hello world").unwrap();
         assert!(path.exists());
         assert_eq!(checksum.len(), 64);
-        // ensure containment under storage dir
         assert!(path.starts_with(dir.path()));
+        assert_eq!(fs::read(path).unwrap(), b"hello world");
     }
 
     #[test]
@@ -112,8 +147,22 @@ mod tests {
         let (c1, p1) = store_artifact(dir.path(), data).unwrap();
         let (c2, p2) = store_artifact(dir.path(), data).unwrap();
         assert_eq!(c1, c2);
-        assert!(p1.exists());
-        assert!(p2.exists());
+        assert_eq!(p1, p2);
+        assert_eq!(fs::read(p1).unwrap(), data);
+    }
+
+    #[test]
+    fn existing_corrupt_content_is_rejected() {
+        let dir = tempdir().unwrap();
+        let data = b"expected content";
+        let checksum = hex::encode(Sha256::digest(data));
+        let prefix = &checksum[0..2];
+        let prefix_dir = dir.path().join(prefix);
+        fs::create_dir_all(&prefix_dir).unwrap();
+        fs::write(prefix_dir.join(&checksum), b"corrupt").unwrap();
+
+        let res = store_artifact(dir.path(), data);
+        assert!(res.is_err());
     }
 
     #[test]
@@ -121,7 +170,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let outside_file = outside.path().join("foo");
-        std::fs::write(&outside_file, b"x").unwrap();
+        fs::write(&outside_file, b"x").unwrap();
         assert!(!path_within_storage(dir.path(), &outside_file));
     }
 
@@ -135,14 +184,10 @@ mod tests {
         let checksum = hex::encode(Sha256::digest(data));
         let prefix = &checksum[0..2];
         let prefix_path = dir.path().join(prefix);
-        // create symlink at prefix pointing outside
         unixfs::symlink(outside.path(), &prefix_path).unwrap();
-        // ensure symlink exists
         assert!(prefix_path.exists());
-        // attempt to store artifact -> should error and not write outside file
         let res = store_artifact(dir.path(), data);
         assert!(res.is_err());
-        // ensure outside did not receive file named checksum
         let outside_file = outside.path().join(&checksum);
         assert!(!outside_file.exists());
     }
