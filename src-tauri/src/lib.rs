@@ -93,12 +93,20 @@ pub fn get_receipt(receipt_id: &str) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn list_contracts() -> Result<serde_json::Value, String> {
+pub fn list_contracts(session_id: Option<&str>) -> Result<serde_json::Value, String> {
     let conn = open_conn()?;
-    let mut stmt = conn
-        .prepare("SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts ORDER BY created_at DESC")
-        .map_err(|_| "query error")?;
-    let mut rows = stmt.query([]).map_err(|_| "query error")?;
+    let sql = if session_id.is_some() {
+        "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts WHERE session_id = ?1 ORDER BY created_at DESC"
+    } else {
+        "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts ORDER BY created_at DESC"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|_| "query error")?;
+    let mut rows = if let Some(session_id) = session_id {
+        stmt.query(rusqlite::params![session_id])
+            .map_err(|_| "query error")?
+    } else {
+        stmt.query([]).map_err(|_| "query error")?
+    };
     let mut out = Vec::new();
     while let Some(r) = rows.next().map_err(|_| "row error")? {
         let id: String = r.get(0).unwrap_or_default();
