@@ -279,19 +279,38 @@ mod tests {
         let path = tmp.path();
         let mut conn = crate::db::init_db(path).expect("init db");
         create_session(&conn, "s-sec2", "Active", None).unwrap();
-        let a = Action { id: "ajwt".to_string(), session_id: "s-sec2".to_string(), parent_id: None, kind: "k".to_string(), meta: None, state: "Created".to_string(), created_at: 1 };
+        let a = Action {
+            id: "ajwt".to_string(),
+            session_id: "s-sec2".to_string(),
+            parent_id: None,
+            kind: "k".to_string(),
+            meta: None,
+            state: "Created".to_string(),
+            created_at: 1,
+        };
         create_action(&conn, &a).unwrap();
         let exec_id = start_execution(&conn, "ajwt").unwrap();
         // JWT without Bearer
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sgnature";
         let aws = format!("AKIA{}", "A".repeat(16));
         let input = format!("start {} middle {} end", jwt, aws);
-        let receipt = finish_execution(&mut conn, &exec_id, "Succeeded", Some(&input), None).unwrap();
-        let stored: String = conn.query_row("SELECT stdout_preview FROM receipts WHERE id = ?1", rusqlite::params![receipt], |r| r.get(0)).unwrap();
+        let receipt =
+            finish_execution(&mut conn, &exec_id, "Succeeded", Some(&input), None).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT stdout_preview FROM receipts WHERE id = ?1",
+                rusqlite::params![receipt],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(!stored.contains("eyJhbGci"));
         assert!(!stored.contains("AKIA"));
         assert!(stored.contains("REDACTED_JWT") || stored.contains("REDACTED"));
-        assert!(stored.contains("REDACTED_AWS_KEY") || stored.contains("REDACTED_TOKEN") || stored.contains("REDACTED"));
+        assert!(
+            stored.contains("REDACTED_AWS_KEY")
+                || stored.contains("REDACTED_TOKEN")
+                || stored.contains("REDACTED")
+        );
     }
 
     #[test]

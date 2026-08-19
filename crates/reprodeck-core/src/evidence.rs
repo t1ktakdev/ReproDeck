@@ -18,12 +18,21 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
     let prefix = &checksum[0..2];
     let dir = storage_dir.join(prefix);
 
-    // If an attacker pre-created a symlink at dir, refuse to proceed.
+    // If an attacker pre-created a symlink or reparse point at dir, refuse to proceed.
     if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(
-                "artifact storage prefix is a symlink",
-            ));
+        // On Unix, file_type().is_symlink() detects symlinks.
+        let mut is_bad = meta.file_type().is_symlink();
+        // On Windows, also treat reparse points/junctions as unsafe (FILE_ATTRIBUTE_REPARSE_POINT = 0x400).
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                is_bad = true;
+            }
+        }
+        if is_bad {
+            return Err(std::io::Error::other("artifact storage prefix is a symlink or reparse point"));
         }
     }
 
