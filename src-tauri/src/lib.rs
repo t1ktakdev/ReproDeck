@@ -308,9 +308,7 @@ fn list_contracts(session_id: Option<String>) -> Result<Vec<ContractDto>, Bridge
 }
 
 #[tauri::command]
-fn list_verification_runs(
-    contract_id: String,
-) -> Result<Vec<VerificationRunDto>, BridgeError> {
+fn list_verification_runs(contract_id: String) -> Result<Vec<VerificationRunDto>, BridgeError> {
     list_verification_runs_service(&contract_id)
 }
 
