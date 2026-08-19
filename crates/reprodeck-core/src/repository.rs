@@ -141,3 +141,123 @@ pub fn get_session_repository(
     info.id = Some(id);
     Ok(Some(info))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{db::init_db, timeline};
+    use git2::{IndexAddOption, Signature};
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn init_repo(path: &Path) -> Repository {
+        let repository = Repository::init(path).unwrap();
+        std::fs::write(path.join("tracked.txt"), "base\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index
+            .add_all(["tracked.txt"], IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = Signature::now("ReproDeck Tests", "tests@reprodeck.local").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        drop(tree);
+        repository
+    }
+
+    #[test]
+    fn inspect_reports_head_and_dirty_state() {
+        let directory = tempdir().unwrap();
+        let repository = init_repo(directory.path());
+        let head = repository.head().unwrap().target().unwrap().to_string();
+        drop(repository);
+
+        let clean = inspect_repository(directory.path()).unwrap();
+        assert_eq!(clean.head_commit, head);
+        assert!(!clean.branch.is_empty());
+        assert!(!clean.is_dirty);
+
+        std::fs::write(directory.path().join("tracked.txt"), "changed\n").unwrap();
+        let dirty = inspect_repository(directory.path()).unwrap();
+        assert!(dirty.is_dirty);
+    }
+
+    #[test]
+    fn attach_and_reload_repository_for_session() {
+        let directory = tempdir().unwrap();
+        let repository = init_repo(directory.path());
+        drop(repository);
+        let db_file = NamedTempFile::new().unwrap();
+        let mut conn = init_db(db_file.path()).unwrap();
+        timeline::create_session(&conn, "session", "Active", None).unwrap();
+
+        let attached =
+            attach_repository_to_session(&mut conn, "session", directory.path()).unwrap();
+        assert!(attached.id.is_some());
+        let session = timeline::get_session_record(&conn, "session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.repo_id, attached.id);
+
+        let reloaded = get_session_repository(&conn, "session").unwrap().unwrap();
+        assert_eq!(reloaded.id, attached.id);
+        assert_eq!(reloaded.path, attached.path);
+        assert_eq!(reloaded.head_commit, attached.head_commit);
+    }
+
+    #[test]
+    fn same_repository_is_reused_across_sessions() {
+        let directory = tempdir().unwrap();
+        let repository = init_repo(directory.path());
+        drop(repository);
+        let db_file = NamedTempFile::new().unwrap();
+        let mut conn = init_db(db_file.path()).unwrap();
+        timeline::create_session(&conn, "one", "Active", None).unwrap();
+        timeline::create_session(&conn, "two", "Active", None).unwrap();
+
+        let first = attach_repository_to_session(&mut conn, "one", directory.path()).unwrap();
+        let second = attach_repository_to_session(&mut conn, "two", directory.path()).unwrap();
+        assert_eq!(first.id, second.id);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn attaching_missing_session_does_not_persist_repository() {
+        let directory = tempdir().unwrap();
+        let repository = init_repo(directory.path());
+        drop(repository);
+        let db_file = NamedTempFile::new().unwrap();
+        let mut conn = init_db(db_file.path()).unwrap();
+
+        assert!(matches!(
+            attach_repository_to_session(&mut conn, "missing", directory.path()),
+            Err(RepositoryError::SessionNotFound(_))
+        ));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn non_repository_is_rejected() {
+        let directory = tempdir().unwrap();
+        assert!(inspect_repository(directory.path()).is_err());
+    }
+
+    #[test]
+    fn unborn_repository_is_rejected() {
+        let directory = tempdir().unwrap();
+        let repository = Repository::init(directory.path()).unwrap();
+        drop(repository);
+        assert!(matches!(
+            inspect_repository(directory.path()),
+            Err(RepositoryError::UnbornRepository)
+        ));
+    }
+}
