@@ -5,21 +5,27 @@ use uuid::Uuid;
 
 fn is_symlink_or_reparse(path: &Path) -> std::io::Result<bool> {
     let meta = fs::symlink_metadata(path)?;
-    let mut is_bad = meta.file_type().is_symlink();
+    let is_symlink = meta.file_type().is_symlink();
 
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            is_bad = true;
-        }
+        let is_reparse = (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        Ok(is_symlink || is_reparse)
     }
 
-    Ok(is_bad)
+    #[cfg(not(windows))]
+    {
+        Ok(is_symlink)
+    }
 }
 
-fn verify_existing_artifact(path: &Path, expected_checksum: &str, expected_size: usize) -> std::io::Result<()> {
+fn verify_existing_artifact(
+    path: &Path,
+    expected_checksum: &str,
+    expected_size: usize,
+) -> std::io::Result<()> {
     if is_symlink_or_reparse(path)? {
         return Err(std::io::Error::other(
             "artifact final path is a symlink or reparse point",
@@ -90,7 +96,7 @@ pub fn store_artifact(storage_dir: &Path, data: &[u8]) -> std::io::Result<(Strin
 
     match fs::rename(&tmp, &finalp) {
         Ok(()) => {}
-        Err(e) if finalp.exists() => {
+        Err(_e) if finalp.exists() => {
             // Another writer may have won the race. Accept it only if the
             // existing content matches the content-addressed identity.
             let _ = fs::remove_file(&tmp);
