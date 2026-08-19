@@ -1,7 +1,8 @@
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,6 +29,95 @@ pub fn create_action(conn: &Connection, a: &Action) -> Result<(), rusqlite::Erro
 pub enum TimelineError {
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Clock(#[from] SystemTimeError),
+    #[error("execution not found: {0}")]
+    ExecutionNotFound(String),
+}
+
+fn unix_time_secs() -> Result<i64, TimelineError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
+
+fn bearer_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*")
+            .expect("static bearer regex must compile")
+    })
+}
+
+fn key_value_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(password|token|secret)\s*[=:]\s*[^\s,;]+")
+            .expect("static key/value regex must compile")
+    })
+}
+
+fn jwt_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+            .expect("static JWT regex must compile")
+    })
+}
+
+fn aws_key_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"AKIA[0-9A-Z]{16}").expect("static AWS access-key regex must compile")
+    })
+}
+
+fn long_hex_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\b[0-9a-fA-F]{40,64}\b").expect("static long-hex regex must compile")
+    })
+}
+
+fn long_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\b[A-Za-z0-9_\-]{40,}\b").expect("static long-token regex must compile")
+    })
+}
+
+fn sanitize_preview(input: &str) -> String {
+    let mut s = bearer_regex()
+        .replace_all(input, "[REDACTED]")
+        .into_owned();
+    s = key_value_regex()
+        .replace_all(&s, "$1=[REDACTED]")
+        .into_owned();
+    s = jwt_regex()
+        .replace_all(&s, "[REDACTED_JWT]")
+        .into_owned();
+    s = aws_key_regex()
+        .replace_all(&s, "[REDACTED_AWS_KEY]")
+        .into_owned();
+    s = long_hex_regex()
+        .replace_all(&s, "[REDACTED_TOKEN]")
+        .into_owned();
+    long_token_regex()
+        .replace_all(&s, "[REDACTED_TOKEN]")
+        .into_owned()
+}
+
+/// Truncate a UTF-8 string to at most `max_bytes` without ever slicing inside
+/// a multi-byte scalar value. Returns the truncated string and whether bytes
+/// were omitted.
+fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> (String, bool) {
+    if input.len() <= max_bytes {
+        return (input.to_owned(), false);
+    }
+
+    let mut end = max_bytes.min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    (input[..end].to_owned(), true)
 }
 
 pub fn create_session(
@@ -36,10 +126,7 @@ pub fn create_session(
     state: &str,
     meta: Option<&str>,
 ) -> Result<(), TimelineError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = unix_time_secs()?;
     conn.execute(
         "INSERT INTO sessions (id, created_at, updated_at, state, meta) VALUES (?1,?2,?3,?4,?5)",
         rusqlite::params![public_id, now, now, state, meta],
@@ -64,10 +151,7 @@ pub fn get_session(
 
 pub fn start_execution(conn: &Connection, action_id: &str) -> Result<String, TimelineError> {
     let exec_id = Uuid::new_v4().to_string();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = unix_time_secs()?;
 
     conn.execute(
         "INSERT INTO executions (id, action_id, status, started_at) VALUES (?1,?2,?3,?4)",
@@ -76,7 +160,9 @@ pub fn start_execution(conn: &Connection, action_id: &str) -> Result<String, Tim
     Ok(exec_id)
 }
 
-/// finish_execution inserts receipt and optional artifact metadata atomically.
+/// Finish an execution and create its receipt in a single transaction.
+/// Sanitization always happens before preview bytes cross the persistence
+/// boundary.
 pub fn finish_execution(
     conn: &mut Connection,
     execution_id: &str,
@@ -85,77 +171,61 @@ pub fn finish_execution(
     stderr_preview: Option<&str>,
 ) -> Result<String, TimelineError> {
     let tx = conn.transaction()?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = unix_time_secs()?;
 
-    // update execution
-    tx.execute(
-        "UPDATE executions SET status = ?1, finished_at = ?2 WHERE id = ?3",
-        rusqlite::params![status, now, execution_id],
+    let started_at = tx
+        .query_row(
+            "SELECT started_at FROM executions WHERE id = ?1",
+            rusqlite::params![execution_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| TimelineError::ExecutionNotFound(execution_id.to_owned()))?;
+    let duration_ms = now.saturating_sub(started_at).saturating_mul(1000);
+
+    let updated = tx.execute(
+        "UPDATE executions SET status = ?1, finished_at = ?2, duration_ms = ?3 WHERE id = ?4",
+        rusqlite::params![status, now, duration_ms, execution_id],
     )?;
-
-    // insert receipt
-    let receipt_id = Uuid::new_v4().to_string();
-    // sanitize then apply preview bounding
-    fn sanitize_preview(input: &str) -> String {
-        // redact bearer tokens
-        let bearer = Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*").unwrap();
-        let mut s = bearer.replace_all(input, "[REDACTED]").into_owned();
-        // redact common key=val patterns for token/password
-        let kv = Regex::new(r"(?i)(password|token|secret)\s*[=:]\s*[^\s,;]+").unwrap();
-        s = kv.replace_all(&s, "$1=[REDACTED]").into_owned();
-        // redact JWT-like tokens (three dot-separated base64url segments)
-        let jwt = Regex::new(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
-        s = jwt.replace_all(&s, "[REDACTED_JWT]").into_owned();
-        // redact AWS-style access keys (AKIA...)
-        let aws = Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
-        s = aws.replace_all(&s, "[REDACTED_AWS_KEY]").into_owned();
-        // redact long hex or base64-like tokens (heuristic)
-        let hex64 = Regex::new(r"\b[0-9a-fA-F]{40,64}\b").unwrap();
-        s = hex64.replace_all(&s, "[REDACTED_TOKEN]").into_owned();
-        let long_token = Regex::new(r"\b[A-Za-z0-9_\-]{40,}\b").unwrap();
-        s = long_token.replace_all(&s, "[REDACTED_TOKEN]").into_owned();
-        s
+    if updated != 1 {
+        return Err(TimelineError::ExecutionNotFound(execution_id.to_owned()));
     }
 
-    // apply preview bounding
     const MAX_PREVIEW: usize = 1024;
     let (sp_owned, spt) = match stdout_preview {
         Some(s) => {
-            let san = sanitize_preview(s);
-            if san.len() > MAX_PREVIEW {
-                (Some(san[..MAX_PREVIEW].to_string()), 1)
-            } else {
-                (Some(san), 0)
-            }
+            let sanitized = sanitize_preview(s);
+            let (bounded, truncated) = truncate_utf8_bytes(&sanitized, MAX_PREVIEW);
+            (Some(bounded), i64::from(truncated))
         }
         None => (None, 0),
     };
     let (ep_owned, ept) = match stderr_preview {
         Some(s) => {
-            let san = sanitize_preview(s);
-            if san.len() > MAX_PREVIEW {
-                (Some(san[..MAX_PREVIEW].to_string()), 1)
-            } else {
-                (Some(san), 0)
-            }
+            let sanitized = sanitize_preview(s);
+            let (bounded, truncated) = truncate_utf8_bytes(&sanitized, MAX_PREVIEW);
+            (Some(bounded), i64::from(truncated))
         }
         None => (None, 0),
     };
 
-    tx.execute("INSERT INTO receipts (id, execution_id, summary, stdout_preview, stderr_preview, stdout_truncated, stderr_truncated, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        rusqlite::params![receipt_id, execution_id, "", sp_owned, ep_owned, spt, ept, now])?;
+    let receipt_id = Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO receipts (id, execution_id, summary, stdout_preview, stderr_preview, stdout_truncated, stderr_truncated, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![receipt_id, execution_id, "", sp_owned, ep_owned, spt, ept, now],
+    )?;
 
     tx.commit()?;
     Ok(receipt_id)
 }
 
-/// Recovery: mark Running -> Interrupted on startup
+/// Recovery: mark Running -> Interrupted on startup.
 pub fn recover_running(conn: &mut Connection) -> Result<usize, TimelineError> {
     let tx = conn.transaction()?;
-    let res = tx.execute("UPDATE executions SET status = 'Interrupted' WHERE status = 'Running' AND finished_at IS NULL", [])?;
+    let res = tx.execute(
+        "UPDATE executions SET status = 'Interrupted' WHERE status = 'Running' AND finished_at IS NULL",
+        [],
+    )?;
     tx.commit()?;
     Ok(res)
 }
@@ -183,7 +253,6 @@ mod tests {
             created_at: 1,
         };
 
-        // session must exist per FK; create minimal session
         conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-1","repo-x",1,1,"Active"]).unwrap();
 
         create_action(&conn, &a).expect("insert");
@@ -202,7 +271,6 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
         let mut conn = crate::db::init_db(path).expect("init db");
-        // insert session with duplicate id
         conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",1,1,"Active"]).unwrap();
         let res = conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["dup-s","r",2,2,"Active"]);
         assert!(res.is_err());
@@ -215,13 +283,11 @@ mod tests {
         let mut conn = crate::db::init_db(path).expect("init db");
         conn.execute("INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES (?1,?2,?3,?4,?5)", rusqlite::params!["s-pag","r",1,1,"Active"]).unwrap();
 
-        // insert multiple actions with same created_at
         for i in 0..5 {
             let id = format!("a-{}", i);
             conn.execute("INSERT INTO actions(id, session_id, kind, state, created_at) VALUES (?1,?2,?3,?4,?5)", rusqlite::params![id, "s-pag", "k", "Created", 1000]).unwrap();
         }
 
-        // pagination by created_seq stable ordering
         let mut stmt = conn
             .prepare("SELECT id FROM actions WHERE session_id = ?1 ORDER BY created_seq LIMIT 2")
             .unwrap();
@@ -230,7 +296,7 @@ mod tests {
             .unwrap();
         let ids: Vec<String> = rows.map(|r| r.unwrap()).collect();
         assert_eq!(ids.len(), 2);
-        // next page
+
         let mut stmt2 = conn.prepare("SELECT id FROM actions WHERE session_id = ?1 AND created_seq > (SELECT created_seq FROM actions WHERE id = ?2) ORDER BY created_seq LIMIT 10").unwrap();
         let rows2 = stmt2
             .query_map(rusqlite::params!["s-pag", ids.last().unwrap()], |r| {
@@ -258,7 +324,6 @@ mod tests {
         };
         create_action(&conn, &a).unwrap();
         let exec_id = start_execution(&conn, "asec").unwrap();
-        // include a bearer token in stdout
         let token = "This has Bearer abcdef12345== inside";
         let receipt =
             finish_execution(&mut conn, &exec_id, "Succeeded", Some(token), None).unwrap();
@@ -290,7 +355,6 @@ mod tests {
         };
         create_action(&conn, &a).unwrap();
         let exec_id = start_execution(&conn, "ajwt").unwrap();
-        // JWT without Bearer
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sgnature";
         let aws = format!("AKIA{}", "A".repeat(16));
         let input = format!("start {} middle {} end", jwt, aws);
@@ -314,12 +378,53 @@ mod tests {
     }
 
     #[test]
+    fn unicode_preview_truncation_is_utf8_safe() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let mut conn = crate::db::init_db(path).expect("init db");
+        create_session(&conn, "s-unicode", "Active", None).unwrap();
+        let a = Action {
+            id: "a-unicode".to_string(),
+            session_id: "s-unicode".to_string(),
+            parent_id: None,
+            kind: "command".to_string(),
+            meta: None,
+            state: "Created".to_string(),
+            created_at: 1,
+        };
+        create_action(&conn, &a).unwrap();
+        let exec_id = start_execution(&conn, &a.id).unwrap();
+        let unicode_output = format!("{}{}", "😀".repeat(300), "русский-текст".repeat(50));
+
+        let receipt = finish_execution(
+            &mut conn,
+            &exec_id,
+            "Succeeded",
+            Some(&unicode_output),
+            None,
+        )
+        .unwrap();
+
+        let (stored, truncated): (String, i64) = conn
+            .query_row(
+                "SELECT stdout_preview, stdout_truncated FROM receipts WHERE id = ?1",
+                rusqlite::params![receipt],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(stored.len() <= MAX_PREVIEW_FOR_TEST);
+        assert_eq!(truncated, 1);
+        assert!(stored.is_char_boundary(stored.len()));
+    }
+
+    const MAX_PREVIEW_FOR_TEST: usize = 1024;
+
+    #[test]
     fn session_action_foreign_key() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
         let mut conn = crate::db::init_db(path).expect("init db");
 
-        // create session
         create_session(&conn, "s-123", "Active", Some("{}")).expect("create session");
 
         let a = Action {
@@ -334,7 +439,6 @@ mod tests {
 
         create_action(&conn, &a).expect("insert action");
 
-        // deleting session should cascade to actions
         conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
             rusqlite::params!["s-123"],
@@ -356,7 +460,6 @@ mod tests {
         let path = tmp.path();
         let mut conn = crate::db::init_db(path).expect("init db");
 
-        // prepare session & action
         create_session(&conn, "s-rcv", "Active", None).unwrap();
         let a = Action {
             id: "act-r".to_string(),
@@ -369,14 +472,10 @@ mod tests {
         };
         create_action(&conn, &a).unwrap();
 
-        // start execution
         let exec_id = start_execution(&conn, "act-r").unwrap();
-
-        // simulate restart by calling recover_running
         let changed = recover_running(&mut conn).unwrap();
         assert!(changed >= 1);
 
-        // check status
         let status: String = conn
             .query_row(
                 "SELECT status FROM executions WHERE id = ?1",
