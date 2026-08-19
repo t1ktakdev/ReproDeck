@@ -81,6 +81,24 @@ pub struct VerificationRunDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutcomeCheckSummaryDto {
+    pub check_id: String,
+    pub stable_id: String,
+    pub description: String,
+    pub required: bool,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutcomeSummaryDto {
+    pub contract_id: String,
+    pub overall: String,
+    pub checks: Vec<OutcomeCheckSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerdictDto {
     pub verdict: String,
 }
@@ -118,6 +136,56 @@ impl From<timeline::ReceiptRecord> for ReceiptDto {
             stdout_truncated: value.stdout_truncated,
             stderr_truncated: value.stderr_truncated,
             created_at: value.created_at,
+        }
+    }
+}
+
+impl From<verification::OutcomeContract> for ContractDto {
+    fn from(value: verification::OutcomeContract) -> Self {
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            title: value.title,
+            description: value.description,
+            state: value.state,
+            version: value.version,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<verification::VerificationRun> for VerificationRunDto {
+    fn from(value: verification::VerificationRun) -> Self {
+        Self {
+            id: value.id,
+            check_id: value.check_id,
+            phase: value.phase.to_string(),
+            status: value.status.to_string(),
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            receipt_id: value.receipt_id,
+        }
+    }
+}
+
+impl From<verification::OutcomeSummary> for OutcomeSummaryDto {
+    fn from(value: verification::OutcomeSummary) -> Self {
+        Self {
+            contract_id: value.contract_id,
+            overall: value.overall.to_string(),
+            checks: value
+                .checks
+                .into_iter()
+                .map(|item| OutcomeCheckSummaryDto {
+                    check_id: item.check.id,
+                    stable_id: item.check.stable_id,
+                    description: item.check.description,
+                    required: item.check.required,
+                    before: item.before.map(|status| status.to_string()),
+                    after: item.after.map(|status| status.to_string()),
+                    outcome: item.outcome.to_string(),
+                })
+                .collect(),
         }
     }
 }
@@ -181,80 +249,36 @@ pub fn get_receipt_service(receipt_id: &str) -> Result<ReceiptDto, BridgeError> 
 
 pub fn list_contracts_service(session_id: Option<&str>) -> Result<Vec<ContractDto>, BridgeError> {
     let conn = open_conn()?;
-    let sql = match session_id {
-        Some(_) => {
-            "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts WHERE session_id = ?1 ORDER BY created_at DESC, id DESC"
-        }
-        None => {
-            "SELECT id, session_id, title, description, state, version, created_at FROM outcome_contracts ORDER BY created_at DESC, id DESC"
-        }
-    };
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|_| BridgeError::database("Unable to prepare the outcome query."))?;
-
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ContractDto> {
-        Ok(ContractDto {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            title: row.get(2)?,
-            description: row.get(3)?,
-            state: row.get(4)?,
-            version: row.get(5)?,
-            created_at: row.get(6)?,
-        })
-    };
-
-    let contracts = if let Some(session_id) = session_id {
-        stmt.query_map(rusqlite::params![session_id], map_row)
-            .map_err(|_| BridgeError::database("Unable to query outcome contracts."))?
-            .collect::<Result<Vec<_>, _>>()
-    } else {
-        stmt.query_map([], map_row)
-            .map_err(|_| BridgeError::database("Unable to query outcome contracts."))?
-            .collect::<Result<Vec<_>, _>>()
-    };
-
-    contracts.map_err(|_| BridgeError::database("Unable to decode outcome contracts."))
+    verification::list_outcome_contracts(&conn, session_id)
+        .map(|values| values.into_iter().map(ContractDto::from).collect())
+        .map_err(|_| BridgeError::database("Unable to list outcome contracts."))
 }
 
 pub fn list_verification_runs_service(
     contract_id: &str,
 ) -> Result<Vec<VerificationRunDto>, BridgeError> {
     let conn = open_conn()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, check_id, phase, status, started_at, finished_at, receipt_id FROM verification_runs WHERE contract_id = ?1 ORDER BY started_at DESC, id DESC",
-        )
-        .map_err(|_| BridgeError::database("Unable to prepare the verification query."))?;
+    verification::list_verification_runs(&conn, contract_id)
+        .map(|values| values.into_iter().map(VerificationRunDto::from).collect())
+        .map_err(|_| BridgeError::database("Unable to list verification runs."))
+}
 
-    let rows = stmt
-        .query_map(rusqlite::params![contract_id], |row| {
-            Ok(VerificationRunDto {
-                id: row.get(0)?,
-                check_id: row.get(1)?,
-                phase: row.get(2)?,
-                status: row.get(3)?,
-                started_at: row.get(4)?,
-                finished_at: row.get(5)?,
-                receipt_id: row.get(6)?,
-            })
+pub fn get_outcome_summary_service(contract_id: &str) -> Result<OutcomeSummaryDto, BridgeError> {
+    let conn = open_conn()?;
+    verification::get_outcome_summary(&conn, contract_id)
+        .map(OutcomeSummaryDto::from)
+        .map_err(|_| {
+            BridgeError::new(
+                "evaluation_failed",
+                "Unable to evaluate this outcome contract.",
+            )
         })
-        .map_err(|_| BridgeError::database("Unable to query verification runs."))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| BridgeError::database("Unable to decode verification runs."))
 }
 
 pub fn evaluate_contract_service(contract_id: &str) -> Result<VerdictDto, BridgeError> {
-    let conn = open_conn()?;
-    let verdict = verification::evaluate_outcome(&conn, contract_id).map_err(|_| {
-        BridgeError::new(
-            "evaluation_failed",
-            "Unable to evaluate this outcome contract.",
-        )
-    })?;
-    Ok(VerdictDto { verdict })
+    get_outcome_summary_service(contract_id).map(|summary| VerdictDto {
+        verdict: summary.overall,
+    })
 }
 
 #[tauri::command]
@@ -288,6 +312,11 @@ fn list_verification_runs(contract_id: String) -> Result<Vec<VerificationRunDto>
 }
 
 #[tauri::command]
+fn get_outcome_summary(contract_id: String) -> Result<OutcomeSummaryDto, BridgeError> {
+    get_outcome_summary_service(&contract_id)
+}
+
+#[tauri::command]
 fn evaluate_contract(contract_id: String) -> Result<VerdictDto, BridgeError> {
     evaluate_contract_service(&contract_id)
 }
@@ -303,6 +332,7 @@ pub fn run() {
             get_receipt,
             list_contracts,
             list_verification_runs,
+            get_outcome_summary,
             evaluate_contract,
         ])
         .run(tauri::generate_context!())
@@ -328,6 +358,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["verdict"], "VerifiedFix");
+    }
+
+    #[test]
+    fn outcome_summary_dto_keeps_business_logic_result() {
+        let summary = verification::OutcomeSummary {
+            contract_id: "contract".to_string(),
+            overall: verification::OutcomeState::VerifiedFix,
+            checks: vec![verification::VerificationCheckSummary {
+                check: verification::VerificationCheck {
+                    id: "check".to_string(),
+                    contract_id: "contract".to_string(),
+                    stable_id: "regression".to_string(),
+                    description: "Regression".to_string(),
+                    command_ref: None,
+                    expected_condition: None,
+                    required: true,
+                    ordering: 0,
+                },
+                before: Some(verification::RunStatus::Failed),
+                after: Some(verification::RunStatus::Passed),
+                outcome: verification::OutcomeState::VerifiedFix,
+            }],
+        };
+        let dto = OutcomeSummaryDto::from(summary);
+        assert_eq!(dto.overall, "VerifiedFix");
+        assert_eq!(dto.checks[0].before.as_deref(), Some("Failed"));
+        assert_eq!(dto.checks[0].after.as_deref(), Some("Passed"));
     }
 
     #[test]
