@@ -192,9 +192,8 @@ mod tests {
         let github = "ghp_abcdefghijklmnopqrstuvwxyz123456";
         let jwt = "abcdefgh.ijklmnop.qrstuvwx";
         let aws = "AKIAABCDEFGHIJKLMNOP";
-        let input = format!(
-            "Authorization=Bearer secret-token password=hunter2 {github} {jwt} {aws}"
-        );
+        let input =
+            format!("Authorization=Bearer secret-token password=hunter2 {github} {jwt} {aws}");
         let redacted = redact_text(&input);
         assert!(!redacted.contains("secret-token"));
         assert!(!redacted.contains("hunter2"));
