@@ -19,7 +19,6 @@ type MResult<T> = std::result::Result<T, MigrationError>;
 const MIGRATIONS: &[(&str, &str)] = &[
     (
         "1",
-        // migration 1: reprodeck_meta and repositories table
         "CREATE TABLE IF NOT EXISTS reprodeck_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -33,7 +32,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     (
         "2",
-        // migration 2: sessions, shadow_workspaces, command_executions, timeline_events, evidence, outcome_criteria
         "CREATE TABLE IF NOT EXISTS sessions (
             created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
             id TEXT UNIQUE NOT NULL,
@@ -87,7 +85,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     (
         "3",
-        // migration 3: actions, executions, receipts, artifacts
         "CREATE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id);
 
         CREATE TABLE IF NOT EXISTS actions (
@@ -144,13 +141,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
             FOREIGN KEY(receipt_id) REFERENCES receipts(id) ON DELETE CASCADE ON UPDATE NO ACTION
         );
 
-        CREATE INDEX IF NOT EXISTS idx_artifacts_receipt ON artifacts(receipt_id);
-        "
+        CREATE INDEX IF NOT EXISTS idx_artifacts_receipt ON artifacts(receipt_id);",
     ),
     (
         "4",
-        "-- migration 4: outcome verification tables and evidence_links
-        CREATE TABLE IF NOT EXISTS outcome_contracts (
+        "CREATE TABLE IF NOT EXISTS outcome_contracts (
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -207,7 +202,99 @@ const MIGRATIONS: &[(&str, &str)] = &[
             role TEXT NOT NULL,
             FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE,
             FOREIGN KEY(run_id) REFERENCES verification_runs(id) ON DELETE CASCADE
-        );"
+        );",
+    ),
+    (
+        "5",
+        "-- Tighten outcome/evidence integrity without destructively rebuilding v4 tables.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_checks_contract_stable
+            ON verification_checks(contract_id, stable_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_check ON verification_runs(check_id);
+        CREATE INDEX IF NOT EXISTS idx_runs_receipt ON verification_runs(receipt_id);
+
+        CREATE TABLE IF NOT EXISTS artifact_links (
+            id TEXT PRIMARY KEY,
+            artifact_id TEXT NOT NULL,
+            run_id TEXT,
+            role TEXT NOT NULL CHECK(role IN ('Before','After','Verification','Diagnostic','Attachment')),
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES verification_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifact_links_artifact ON artifact_links(artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_artifact_links_run ON artifact_links(run_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_outcome_contract_session_insert
+        BEFORE INSERT ON outcome_contracts
+        WHEN NOT EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'outcome contract session does not exist');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_outcome_contract_session_update
+        BEFORE UPDATE OF session_id ON outcome_contracts
+        WHEN NOT EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'outcome contract session does not exist');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_sessions_delete_outcome_contracts
+        AFTER DELETE ON sessions
+        BEGIN
+            DELETE FROM outcome_contracts WHERE session_id = OLD.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_check_insert
+        BEFORE INSERT ON verification_runs
+        WHEN NEW.check_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM verification_checks
+            WHERE id = NEW.check_id AND contract_id = NEW.contract_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'verification check does not belong to contract');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_check_update
+        BEFORE UPDATE OF check_id, contract_id ON verification_runs
+        WHEN NEW.check_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM verification_checks
+            WHERE id = NEW.check_id AND contract_id = NEW.contract_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'verification check does not belong to contract');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_receipt_insert
+        BEFORE INSERT ON verification_runs
+        WHEN NEW.receipt_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM receipts WHERE id = NEW.receipt_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'verification receipt does not exist');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_receipt_update
+        BEFORE UPDATE OF receipt_id ON verification_runs
+        WHEN NEW.receipt_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM receipts WHERE id = NEW.receipt_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'verification receipt does not exist');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_state_insert
+        BEFORE INSERT ON verification_runs
+        WHEN NEW.phase NOT IN ('Before','After') OR NEW.status NOT IN ('Pending','Running','Passed','Failed','Error','Interrupted')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid verification phase or status');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_verification_run_state_update
+        BEFORE UPDATE OF phase, status ON verification_runs
+        WHEN NEW.phase NOT IN ('Before','After') OR NEW.status NOT IN ('Pending','Running','Passed','Failed','Error','Interrupted')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid verification phase or status');
+        END;",
     ),
 ];
 
@@ -216,32 +303,31 @@ fn current_migration_version() -> i64 {
 }
 
 fn get_db_schema_version(conn: &Connection) -> MResult<i64> {
-    let val: Result<String, rusqlite::Error> = conn.query_row(
+    let value: Result<String, rusqlite::Error> = conn.query_row(
         "SELECT value FROM reprodeck_meta WHERE key = 'schema_version'",
         [],
-        |r| r.get(0),
+        |row| row.get(0),
     );
 
-    match val {
-        Ok(v) => v
+    match value {
+        Ok(value) => value
             .parse::<i64>()
             .map_err(|_| MigrationError::MigrationFailed("schema_version corrupted".to_string())),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
-        Err(e) => Err(MigrationError::Db(e)),
+        Err(error) => Err(MigrationError::Db(error)),
     }
 }
 
 #[allow(dead_code)]
-fn set_db_schema_version(conn: &Connection, v: i64) -> MResult<()> {
+fn set_db_schema_version(conn: &Connection, version: i64) -> MResult<()> {
     conn.execute(
         "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",
-        params![v.to_string()],
+        params![version.to_string()],
     )?;
     Ok(())
 }
 
-/// Apply pending migrations in order. Transaction-safe per migration using BEGIN/COMMIT inside SQL.
 fn apply_migrations(conn: &mut Connection) -> MResult<()> {
     let current = get_db_schema_version(conn)?;
     let latest = current_migration_version();
@@ -249,14 +335,13 @@ fn apply_migrations(conn: &mut Connection) -> MResult<()> {
         return Err(MigrationError::UnknownSchemaVersion(current));
     }
 
-    for i in (current as usize + 1)..=MIGRATIONS.len() {
-        let (ver, sql) = MIGRATIONS.get(i - 1).unwrap();
-        // execute migration inside a Rust-owned transaction
+    for index in (current as usize + 1)..=MIGRATIONS.len() {
+        let (version, sql) = MIGRATIONS.get(index - 1).expect("migration index is valid");
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
-            params![ver.parse::<i64>().unwrap().to_string()],
+            params![version.parse::<i64>().expect("static migration version").to_string()],
         )?;
         tx.commit()?;
     }
@@ -264,25 +349,15 @@ fn apply_migrations(conn: &mut Connection) -> MResult<()> {
     Ok(())
 }
 
-/// Initialise or open the SQLite database at `path` and ensure required schema via migrations.
 pub fn init_db(path: &Path) -> MResult<Connection> {
     let mut conn = Connection::open(path)?;
-
-    // pragmas and connection-level settings
-    // enable foreign keys
     conn.pragma_update(None, "foreign_keys", true)?;
-    // journal mode and synchronous for WAL durability/performance tradeoff
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-    // busy timeout (ms)
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-
-    // ensure reprodeck_meta exists so we can store schema_version
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS reprodeck_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
-
     apply_migrations(&mut conn)?;
-
     Ok(conn)
 }
 
@@ -294,40 +369,25 @@ mod tests {
     #[test]
     fn fresh_db_applies_all_migrations() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-
-        let conn = init_db(path).expect("init db");
-
-        let ver = get_db_schema_version(&conn).unwrap();
-        assert_eq!(ver, current_migration_version());
+        let conn = init_db(tmp.path()).unwrap();
+        assert_eq!(get_db_schema_version(&conn).unwrap(), current_migration_version());
     }
 
     #[test]
     fn pragmas_and_foreign_keys_enabled() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let conn = init_db(path).expect("init db");
-        // check foreign_keys pragma
-        let fk: i64 = conn
-            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fk, 1);
-        // check journal_mode (string)
-        let jm: String = conn
-            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
-            .unwrap();
-        assert!(jm.eq_ignore_ascii_case("wal"));
+        let conn = init_db(tmp.path()).unwrap();
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys;", [], |row| row.get(0)).unwrap();
+        assert_eq!(foreign_keys, 1);
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0)).unwrap();
+        assert!(journal_mode.eq_ignore_ascii_case("wal"));
     }
 
     #[test]
     fn upgrade_from_previous_schema() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-
-        // create DB with only migration 1 applied
-        let mut conn = Connection::open(path).unwrap();
+        let mut conn = Connection::open(tmp.path()).unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        // apply migration 1 inside transaction
         let tx = conn.transaction().unwrap();
         tx.execute_batch(MIGRATIONS[0].1).unwrap();
         tx.execute(
@@ -337,74 +397,125 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        // now init_db should apply migration 2
-        let conn2 = init_db(path).expect("migrate");
-        let ver = get_db_schema_version(&conn2).unwrap();
-        assert_eq!(ver, current_migration_version());
+        let conn = init_db(tmp.path()).unwrap();
+        assert_eq!(get_db_schema_version(&conn).unwrap(), current_migration_version());
     }
 
     #[test]
     fn init_db_idempotent() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let _ = init_db(path).unwrap();
-        let _ = init_db(path).unwrap();
+        init_db(tmp.path()).unwrap();
+        init_db(tmp.path()).unwrap();
     }
 
     #[test]
     fn unsupported_newer_schema_is_rejected() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let conn = Connection::open(path).unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute_batch("CREATE TABLE IF NOT EXISTS reprodeck_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
         conn.execute(
             "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1)",
             params!["999"],
         )
         .unwrap();
-        let res = init_db(path);
-        assert!(matches!(res, Err(MigrationError::UnknownSchemaVersion(_))));
+        assert!(matches!(init_db(tmp.path()), Err(MigrationError::UnknownSchemaVersion(_))));
     }
 
     #[test]
     fn corrupted_schema_version_returns_error() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let conn = Connection::open(path).unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute_batch("CREATE TABLE IF NOT EXISTS reprodeck_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
         conn.execute(
             "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1)",
             params!["not-a-number"],
         )
         .unwrap();
-        let res = init_db(path);
-        assert!(matches!(res, Err(MigrationError::MigrationFailed(_))));
+        assert!(matches!(init_db(tmp.path()), Err(MigrationError::MigrationFailed(_))));
     }
 
     #[test]
     fn failing_migration_rolls_back() {
         let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        let conn = Connection::open(path).unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
         conn.execute_batch("CREATE TABLE IF NOT EXISTS reprodeck_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
         conn.execute(
             "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1)",
             params!["1"],
         )
         .unwrap();
-
-        // apply a failing migration inside a transaction and ensure rollback
-        let mut conn2 = Connection::open(path).unwrap();
-        let tx = conn2.transaction().unwrap();
-        // a migration that creates a table then fails
-        let res = tx.execute_batch("CREATE TABLE test_temp(id INTEGER);; INVALID SQL;");
-        assert!(res.is_err());
+        let mut conn = Connection::open(tmp.path()).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(tx.execute_batch("CREATE TABLE test_temp(id INTEGER); INVALID SQL;").is_err());
         drop(tx);
-        // ensure schema_version still 1
-        let ver = get_db_schema_version(&conn2).unwrap();
-        assert_eq!(ver, 1);
+        assert_eq!(get_db_schema_version(&conn).unwrap(), 1);
+    }
+
+    fn seed_session_and_contract(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO sessions(id, repo_id, created_at, updated_at, state) VALUES ('s1','r',1,1,'Active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outcome_contracts(id, session_id, title, state, version, created_at) VALUES ('c1','s1','contract','Draft',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outcome_contracts(id, session_id, title, state, version, created_at) VALUES ('c2','s1','contract2','Draft',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_checks(id, contract_id, stable_id, description, required, ordering) VALUES ('check1','c1','stable','check',1,0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn outcome_contract_requires_existing_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = init_db(tmp.path()).unwrap();
+        let result = conn.execute(
+            "INSERT INTO outcome_contracts(id, session_id, title, state, version, created_at) VALUES ('bad','missing','x','Draft',1,1)",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verification_check_must_belong_to_run_contract() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = init_db(tmp.path()).unwrap();
+        seed_session_and_contract(&conn);
+        let result = conn.execute(
+            "INSERT INTO verification_runs(id, contract_id, check_id, phase, status, started_at) VALUES ('run','c2','check1','Before','Running',1)",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verification_state_values_are_enforced() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = init_db(tmp.path()).unwrap();
+        seed_session_and_contract(&conn);
+        let result = conn.execute(
+            "INSERT INTO verification_runs(id, contract_id, check_id, phase, status, started_at) VALUES ('run','c1','check1','Maybe','Magic',1)",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deleting_session_cascades_outcome_contracts_via_trigger() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = init_db(tmp.path()).unwrap();
+        seed_session_and_contract(&conn);
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM outcome_contracts", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
     }
 }
