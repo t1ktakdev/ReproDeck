@@ -16,8 +16,9 @@ pub enum Permission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionReason {
     Configured,
+    ExplicitApproval,
     HardDeniedPrivilegeEscalation,
-    UnsafeVerificationCommand,
+    HardDeniedVerificationMutation,
     OpaqueShellCommand,
 }
 
@@ -34,6 +35,14 @@ impl PermissionDecision {
             permission,
             reason: PermissionReason::Configured,
             explanation: "Configured command permission applies.".to_string(),
+        }
+    }
+
+    fn explicitly_approved() -> Self {
+        Self {
+            permission: Permission::Allow,
+            reason: PermissionReason::ExplicitApproval,
+            explanation: "The user explicitly approved this verification command once.".to_string(),
         }
     }
 }
@@ -54,26 +63,53 @@ fn first_arg(args: &[String]) -> Option<&str> {
         .find(|arg| !arg.trim().is_empty() && !arg.starts_with('-'))
 }
 
-/// Apply the additional policy used specifically for BEFORE/AFTER verification.
-/// Verification is evidence-gathering, so it must not silently mutate Git
-/// history, publish changes, escalate privileges, or hide arbitrary commands in
-/// an opaque shell string.
+fn is_privilege_escalation(executable: &str) -> bool {
+    matches!(executable, "sudo" | "doas" | "pkexec" | "runas")
+}
+
+fn is_shell(executable: &str) -> bool {
+    matches!(
+        executable,
+        "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh"
+    )
+}
+
+fn is_mutating_git(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "push"
+            | "commit"
+            | "reset"
+            | "clean"
+            | "checkout"
+            | "switch"
+            | "merge"
+            | "rebase"
+            | "cherry-pick"
+            | "revert"
+            | "tag"
+            | "branch"
+            | "worktree"
+            | "stash"
+    )
+}
+
+/// Evaluate a BEFORE/AFTER verification command.
 ///
-/// The configured permission is still authoritative for ordinary safe commands:
-/// `Ask` remains Ask and `Deny` remains Deny. Only a configured `Allow` can be
-/// reduced by the verification safety policy below.
-pub fn verification_command_permission(
+/// Verification is evidence gathering, not a repository mutation mechanism.
+/// Privilege escalation and mutating/publishing Git operations are therefore
+/// hard-denied even when a caller claims explicit approval. Opaque shell
+/// wrappers and configured `Ask` rules can be satisfied by a one-shot explicit
+/// approval, while configured `Deny` remains authoritative.
+pub fn verification_command_permission_with_approval(
     executable: &str,
     args: &[String],
     configured: Permission,
+    explicitly_approved_once: bool,
 ) -> PermissionDecision {
-    if configured != Permission::Allow {
-        return PermissionDecision::configured(configured);
-    }
-
     let executable = executable_name(executable);
 
-    if matches!(executable.as_str(), "sudo" | "doas" | "pkexec" | "runas") {
+    if is_privilege_escalation(&executable) {
         return PermissionDecision {
             permission: Permission::Deny,
             reason: PermissionReason::HardDeniedPrivilegeEscalation,
@@ -81,48 +117,47 @@ pub fn verification_command_permission(
         };
     }
 
-    if matches!(
-        executable.as_str(),
-        "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh"
-    ) {
-        return PermissionDecision {
-            permission: Permission::Ask,
-            reason: PermissionReason::OpaqueShellCommand,
-            explanation: "Shell-wrapped verification commands require explicit approval."
-                .to_string(),
-        };
-    }
-
     if executable == "git" {
         let subcommand = first_arg(args).unwrap_or("").to_ascii_lowercase();
-        if matches!(
-            subcommand.as_str(),
-            "push"
-                | "commit"
-                | "reset"
-                | "clean"
-                | "checkout"
-                | "switch"
-                | "merge"
-                | "rebase"
-                | "cherry-pick"
-                | "revert"
-                | "tag"
-                | "branch"
-                | "worktree"
-                | "stash"
-        ) {
+        if is_mutating_git(&subcommand) {
             return PermissionDecision {
-                permission: Permission::Ask,
-                reason: PermissionReason::UnsafeVerificationCommand,
+                permission: Permission::Deny,
+                reason: PermissionReason::HardDeniedVerificationMutation,
                 explanation: format!(
-                    "`git {subcommand}` may mutate or publish repository state and requires explicit approval."
+                    "`git {subcommand}` is not permitted from verification because verification must not mutate or publish repository state."
                 ),
             };
         }
     }
 
-    PermissionDecision::configured(Permission::Allow)
+    if configured == Permission::Deny {
+        return PermissionDecision::configured(Permission::Deny);
+    }
+
+    if is_shell(&executable) && !explicitly_approved_once {
+        return PermissionDecision {
+            permission: Permission::Ask,
+            reason: PermissionReason::OpaqueShellCommand,
+            explanation: "Shell-wrapped verification commands require explicit one-shot approval."
+                .to_string(),
+        };
+    }
+
+    match configured {
+        Permission::Allow => PermissionDecision::configured(Permission::Allow),
+        Permission::Ask if explicitly_approved_once => PermissionDecision::explicitly_approved(),
+        Permission::Ask => PermissionDecision::configured(Permission::Ask),
+        Permission::Deny => PermissionDecision::configured(Permission::Deny),
+    }
+}
+
+/// Evaluate a verification command without an explicit one-shot approval.
+pub fn verification_command_permission(
+    executable: &str,
+    args: &[String],
+    configured: Permission,
+) -> PermissionDecision {
+    verification_command_permission_with_approval(executable, args, configured, false)
 }
 
 #[cfg(test)]
@@ -134,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_and_deny_are_never_upgraded() {
+    fn ask_and_deny_are_not_silently_upgraded() {
         assert_eq!(
             verification_command_permission("cargo", &args(&["test"]), Permission::Ask).permission,
             Permission::Ask
@@ -143,6 +178,18 @@ mod tests {
             verification_command_permission("cargo", &args(&["test"]), Permission::Deny).permission,
             Permission::Deny
         );
+    }
+
+    #[test]
+    fn explicit_approval_satisfies_ask_once() {
+        let decision = verification_command_permission_with_approval(
+            "cargo",
+            &args(&["test"]),
+            Permission::Ask,
+            true,
+        );
+        assert_eq!(decision.permission, Permission::Allow);
+        assert_eq!(decision.reason, PermissionReason::ExplicitApproval);
     }
 
     #[test]
@@ -157,12 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn privilege_escalation_is_hard_denied() {
+    fn privilege_escalation_is_hard_denied_even_after_approval() {
         for executable in ["sudo", "doas", "pkexec", "runas.exe"] {
-            let decision = verification_command_permission(
+            let decision = verification_command_permission_with_approval(
                 executable,
                 &args(&["anything"]),
                 Permission::Allow,
+                true,
             );
             assert_eq!(decision.permission, Permission::Deny);
             assert_eq!(
@@ -173,23 +221,39 @@ mod tests {
     }
 
     #[test]
-    fn opaque_shell_requires_approval() {
-        let decision = verification_command_permission(
+    fn opaque_shell_requires_approval_but_can_be_approved_once() {
+        let shell_args = args(&["-Command", "cargo test"]);
+        let first = verification_command_permission(
             "powershell.exe",
-            &args(&["-Command", "Remove-Item -Recurse ."]),
+            &shell_args,
             Permission::Allow,
         );
-        assert_eq!(decision.permission, Permission::Ask);
-        assert_eq!(decision.reason, PermissionReason::OpaqueShellCommand);
+        assert_eq!(first.permission, Permission::Ask);
+        assert_eq!(first.reason, PermissionReason::OpaqueShellCommand);
+
+        let approved = verification_command_permission_with_approval(
+            "powershell.exe",
+            &shell_args,
+            Permission::Allow,
+            true,
+        );
+        assert_eq!(approved.permission, Permission::Allow);
     }
 
     #[test]
-    fn mutating_git_commands_require_approval() {
+    fn mutating_git_commands_are_hard_denied_from_verification() {
         for subcommand in ["push", "commit", "reset", "clean", "rebase", "worktree"] {
-            let decision =
-                verification_command_permission("git.exe", &args(&[subcommand]), Permission::Allow);
-            assert_eq!(decision.permission, Permission::Ask, "{subcommand}");
-            assert_eq!(decision.reason, PermissionReason::UnsafeVerificationCommand);
+            let decision = verification_command_permission_with_approval(
+                "git.exe",
+                &args(&[subcommand]),
+                Permission::Allow,
+                true,
+            );
+            assert_eq!(decision.permission, Permission::Deny, "{subcommand}");
+            assert_eq!(
+                decision.reason,
+                PermissionReason::HardDeniedVerificationMutation
+            );
         }
     }
 
@@ -200,5 +264,16 @@ mod tests {
                 verification_command_permission("git", &args(&[subcommand]), Permission::Allow);
             assert_eq!(decision.permission, Permission::Allow, "{subcommand}");
         }
+    }
+
+    #[test]
+    fn explicit_approval_does_not_override_configured_deny() {
+        let decision = verification_command_permission_with_approval(
+            "cargo",
+            &args(&["test"]),
+            Permission::Deny,
+            true,
+        );
+        assert_eq!(decision.permission, Permission::Deny);
     }
 }
