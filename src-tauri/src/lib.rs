@@ -1,7 +1,7 @@
-use reprodeck_core::{db, evidence, timeline, verification};
+use reprodeck_core::{db, evidence, repository, timeline, verification};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BridgeError {
@@ -33,10 +33,20 @@ impl std::error::Error for BridgeError {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionDto {
     pub id: String,
+    pub repo_id: Option<String>,
     pub created_at: i64,
     pub updated_at: Option<i64>,
     pub state: String,
     pub meta: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryDto {
+    pub id: Option<String>,
+    pub path: String,
+    pub head_commit: String,
+    pub branch: String,
+    pub is_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,10 +146,23 @@ impl From<timeline::SessionRecord> for SessionDto {
     fn from(value: timeline::SessionRecord) -> Self {
         Self {
             id: value.id,
+            repo_id: value.repo_id,
             created_at: value.created_at,
             updated_at: value.updated_at,
             state: value.state,
             meta: value.meta,
+        }
+    }
+}
+
+impl From<repository::RepositoryInfo> for RepositoryDto {
+    fn from(value: repository::RepositoryInfo) -> Self {
+        Self {
+            id: value.id,
+            path: value.path,
+            head_commit: value.head_commit,
+            branch: value.branch,
+            is_dirty: value.is_dirty,
         }
     }
 }
@@ -263,6 +286,26 @@ fn open_conn() -> Result<rusqlite::Connection, BridgeError> {
         .map_err(|_| BridgeError::database("Unable to initialize ReproDeck storage."))
 }
 
+fn repository_error(error: repository::RepositoryError) -> BridgeError {
+    match error {
+        repository::RepositoryError::SessionNotFound(_) => {
+            BridgeError::new("not_found", "Session not found.")
+        }
+        repository::RepositoryError::UnbornRepository => BridgeError::new(
+            "repository_unborn",
+            "The Git repository needs at least one commit before ReproDeck can attach it.",
+        ),
+        repository::RepositoryError::NonUtf8Path => BridgeError::new(
+            "repository_path_unsupported",
+            "This repository path cannot be represented safely by the desktop bridge.",
+        ),
+        _ => BridgeError::new(
+            "repository_invalid",
+            "The selected path is not an accessible Git working repository.",
+        ),
+    }
+}
+
 pub fn list_sessions_service() -> Result<Vec<SessionDto>, BridgeError> {
     let conn = open_conn()?;
     timeline::list_sessions(&conn, None, 200)
@@ -286,6 +329,45 @@ pub fn create_session_service(id: &str) -> Result<SessionDto, BridgeError> {
         .map_err(|_| BridgeError::database("Unable to read the created session."))?
         .map(SessionDto::from)
         .ok_or_else(|| BridgeError::database("Created session could not be loaded."))
+}
+
+pub fn inspect_repository_service(path: &str) -> Result<RepositoryDto, BridgeError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(BridgeError::new(
+            "invalid_request",
+            "Repository path must not be empty.",
+        ));
+    }
+    repository::inspect_repository(Path::new(path))
+        .map(RepositoryDto::from)
+        .map_err(repository_error)
+}
+
+pub fn attach_repository_service(
+    session_id: &str,
+    path: &str,
+) -> Result<RepositoryDto, BridgeError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(BridgeError::new(
+            "invalid_request",
+            "Repository path must not be empty.",
+        ));
+    }
+    let mut conn = open_conn()?;
+    repository::attach_repository_to_session(&mut conn, session_id, Path::new(path))
+        .map(RepositoryDto::from)
+        .map_err(repository_error)
+}
+
+pub fn get_session_repository_service(
+    session_id: &str,
+) -> Result<Option<RepositoryDto>, BridgeError> {
+    let conn = open_conn()?;
+    repository::get_session_repository(&conn, session_id)
+        .map(|value| value.map(RepositoryDto::from))
+        .map_err(repository_error)
 }
 
 pub fn list_actions_service(session_id: &str) -> Result<Vec<ActionDto>, BridgeError> {
@@ -393,6 +475,21 @@ fn create_session(id: String) -> Result<SessionDto, BridgeError> {
 }
 
 #[tauri::command]
+fn inspect_repository(path: String) -> Result<RepositoryDto, BridgeError> {
+    inspect_repository_service(&path)
+}
+
+#[tauri::command]
+fn attach_repository(session_id: String, path: String) -> Result<RepositoryDto, BridgeError> {
+    attach_repository_service(&session_id, &path)
+}
+
+#[tauri::command]
+fn get_session_repository(session_id: String) -> Result<Option<RepositoryDto>, BridgeError> {
+    get_session_repository_service(&session_id)
+}
+
+#[tauri::command]
 fn list_actions(session_id: String) -> Result<Vec<ActionDto>, BridgeError> {
     list_actions_service(&session_id)
 }
@@ -434,6 +531,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             create_session,
+            inspect_repository,
+            attach_repository,
+            get_session_repository,
             list_actions,
             list_timeline_entries,
             get_receipt,
@@ -465,6 +565,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["verdict"], "VerifiedFix");
+    }
+
+    #[test]
+    fn repository_dto_preserves_runtime_status() {
+        let dto = RepositoryDto::from(repository::RepositoryInfo {
+            id: Some("repo".to_string()),
+            path: "C:/work/repo".to_string(),
+            head_commit: "abcdef".to_string(),
+            branch: "main".to_string(),
+            is_dirty: true,
+        });
+        assert_eq!(dto.id.as_deref(), Some("repo"));
+        assert_eq!(dto.branch, "main");
+        assert!(dto.is_dirty);
     }
 
     #[test]
