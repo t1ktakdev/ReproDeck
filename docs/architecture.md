@@ -1,37 +1,67 @@
-ReproDeck Architecture (core storage and recovery)
+# Architecture
 
-Overview
-- ReproDeck core stores two distinct categories of persistent data:
-  1. Recovery DB (global): manages crash-recovery state for shadow workspaces and pending cleanup. Location: application-managed data directory (platform default, e.g. %LOCALAPPDATA%/reprodeck or $XDG_DATA_HOME/reprodeck). File: recovery.db
-  2. Project DB (per-session/project): stored inside project-managed location (preferably .reprodeck within a separate managed directory or next to project as configured). Contains sessions, timeline_events, command_executions, evidence metadata and links to artifact files.
+ReproDeck is split into a local Rust engineering core, a thin Tauri adapter and a React desktop UI. The architecture is evidence-first: React and an AI model may request operations and present results, but only the Rust core can establish proof state or mutate an approved target.
 
-Why two databases
-- Recovery DB must be accessible before opening any project DB: after a crash, we need to know which repos have pending cleanup without trusting project workspace. It stores minimal global state to recover shadow worktrees.
-- Project DB contains richer domain data tied to a session and is owned by that project/session lifecycle.
+## Product layers
 
-Physical locations
-- Recovery DB: $APPDATA/reprodeck/recovery.db (or OS equivalent). Owned by ReproDeck process and survives across sessions.
-- Project DB: placed under application-managed directory per session (e.g. $APPDATA/reprodeck/artifacts/<repo-hash>/project.db) or optionally next to project when configured. Avoid writing arbitrary files into the user's repo root.
+```text
+React desktop UI
+      │
+Thin Tauri commands
+      │
+┌──────────────────────────────────────────────┐
+│ Project Intelligence                        │
+│ Context Compiler                            │
+│ Problem / Root-cause domain                 │
+│ Optional AI provider                        │
+│                                              │
+│ Proof Engine                                │
+│  ├─ safe runner / permissions               │
+│  ├─ timeline / evidence / artifacts         │
+│  ├─ Git shadow workspace                    │
+│  ├─ Before / After verification             │
+│  └─ conflict-safe Apply / recovery           │
+│                                              │
+│ SQLite / capsule / redaction / integrations │
+└──────────────────────────────────────────────┘
+```
 
-Lifecycle ownership
-- Recovery DB: ReproDeck process owns creation, cleanup, and migration lifecycle.
-- Project DB: created when a session starts and migrated by ReproDeck. Removal of a project/session should not automatically delete recovery entries for that repo, but recovery entries referencing missing repo paths will be ignored or cleaned by operator action.
+## Project Intelligence
 
-Crash behavior
-- Recovery DB: on crash, ReproDeck will read recovery.db to find AppliedCleanupPending entries and attempt retry_cleanup on startup or via user action.
-- Project DB: if process crashes during a migration, the transaction-based migration ensures either previous schema/version remains intact or migration completes fully. Project DB corruption is surfaced as typed errors and requires operator action.
+`project_intelligence` is a deterministic read-only discovery layer. It builds a persisted `ProjectProfile` for Git and non-Git folders. Scans are bounded, generated/vendor directories are skipped, symlinks are not followed, secret-like paths are excluded and Git ignore decisions are respected when available.
 
-Migration semantics
-- Recovery DB migrations: applied automatically on startup; small and atomic. The migration runner opens a Rust transaction per migration, applies SQL, updates schema_version within same transaction, commits.
-- Project DB migrations: same runner and semantics; migrations are Rust-owned transactions. SQL migration scripts must not include their own BEGIN/COMMIT — runner enforces transaction boundaries.
+Discovery returns candidate commands but never runs them. This is an important trust boundary: opening an unknown repository cannot execute its `package.json`, build script or arbitrary executable.
 
-Deletion and cleanup
-- Deleting a project/session: should remove project DB and artifacts; recovery entries referencing the repo should be either removed or marked; ReproDeck will not implicitly remove user repository content.
+## Context Compiler
 
-Notes
-- Do not create files inside user's repository working tree for ReproDeck metadata. Use app-managed directories for recovery and artifacts.
+`context_compiler` ranks repository text against a concrete investigation question and returns a bounded, inspectable `ContextPacket`. Snippets carry stable `ctx:*` IDs, source paths, line ranges, reasons, checksums and redacted content. The packet intentionally limits both file count and character count so local/small models receive focused evidence rather than a repository dump.
 
-Upstream references and rationale
-- Git delta/patch formats and machine-safe output: use `git diff -z --name-status` for NUL-delimited paths to handle arbitrary filenames (see: https://git-scm.com/docs/git-diff).
-- Rust process handling: prefer direct spawning via std::process::Command, stream reads in separate threads to avoid deadlocks; check docs: https://doc.rust-lang.org/std/process/index.html.
- - Windows process-tree handling: full reliable termination of grandchildren requires Job Objects; creating a Job Object and assigning processes is the robust approach on Windows (see Microsoft Job Objects docs: https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects). Current implementation uses Job Objects (KILL_ON_JOB_CLOSE) and is covered by unit tests validating process-tree termination semantics on Windows.
+## Problem domain
+
+The problem lifecycle is explicit:
+
+`Signal → Suspected → Reproduced → RootCaused → FixProposed → Verified → Applied`
+
+Evidence is required for states that assert reproduction, root cause and verification. This prevents UI or AI text from silently becoming product truth.
+
+## AI boundary
+
+AI is an optional reasoning adapter. The provider receives sanitized project facts and selected context snippets only after an explicit network confirmation. The model can propose hypotheses and next experiments, but cannot change permissions, verification state, Git state or Apply state.
+
+## Proof Engine
+
+The proven debugging engine owns executable + argv process execution, permissions, Git worktree isolation, timeline receipts, typed evidence, protected verification cycles, Before/After verdicts, diff review, conflict checks, Apply, Discard and crash recovery.
+
+The original repository is inspected but not used as the fix workspace. ReproDeck creates a controlled worktree from a recorded base commit. Apply rejects incompatible HEAD or local changes rather than silently overwriting them. ReproDeck never commits or pushes automatically.
+
+## Storage
+
+SQLite stores project profiles, sessions and structured domain metadata. Large logs/evidence payloads use a content-addressed filesystem store with checksum-bearing records. `.reprodeck` is a versioned portable evidence archive with strict allow-list, path, hash and size validation.
+
+## Adapter boundaries
+
+`src-tauri` maps desktop calls to core functions and stable user-facing failures. It must stay thin. `src` renders returned state and local interaction state; it must not manufacture terminal output, diffs, evidence, root cause or verification results.
+
+## Network boundary
+
+The default product is local. GitHub and AI are opt-in integrations. Network/publishing actions require explicit confirmation. No telemetry or hidden repository upload is part of the architecture.

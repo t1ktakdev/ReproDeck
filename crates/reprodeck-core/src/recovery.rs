@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -16,9 +17,11 @@ pub enum RecoveryError {
         code: i32,
         stderr: String,
     },
+    #[error("unsafe recovery record: {0}")]
+    UnsafeRecoveryEntry(&'static str),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum ShadowState {
     Active,
     Applied,
@@ -27,7 +30,7 @@ pub enum ShadowState {
     CleanupFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryEntry {
     pub id: String,
     pub repo_path: PathBuf,
@@ -39,6 +42,7 @@ pub struct RecoveryEntry {
     pub last_error: Option<String>,
 }
 
+#[cfg(not(test))]
 fn app_data_dir() -> PathBuf {
     if let Some(proj_dir) = directories::BaseDirs::new() {
         let mut p = proj_dir.data_local_dir().to_path_buf();
@@ -50,10 +54,21 @@ fn app_data_dir() -> PathBuf {
 }
 
 fn recovery_db_path() -> PathBuf {
-    let mut p = app_data_dir();
-    std::fs::create_dir_all(&p).ok();
-    p.push("recovery.db");
-    p
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!(
+            "reprodeck-recovery-tests-{}.db",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(not(test))]
+    {
+        let mut p = app_data_dir();
+        std::fs::create_dir_all(&p).ok();
+        p.push("recovery.db");
+        p
+    }
 }
 
 fn open_db() -> Result<Connection, RecoveryError> {
@@ -77,8 +92,8 @@ fn open_db() -> Result<Connection, RecoveryError> {
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub fn create_pending(
@@ -190,76 +205,112 @@ pub fn get_entry(id: &str) -> Result<Option<RecoveryEntry>, RecoveryError> {
 
 /// Attempt to perform cleanup: remove worktree and delete branch. Idempotent.
 pub fn retry_cleanup(id: &str) -> Result<(), RecoveryError> {
-    let entry = get_entry(id)?;
-    if entry.is_none() {
+    let Some(e) = get_entry(id)? else {
         return Ok(());
-    }
-    let e = entry.unwrap();
-    // perform git worktree remove and branch delete
+    };
     let repo = Path::new(&e.repo_path);
-    // run git worktree remove <path> --force
-    // run worktree remove
-    // debug: print current worktree list for visibility when debugging tests
-    // no debug output
-
-    let out1 = std::process::Command::new("git")
-        .current_dir(repo)
-        .args([
-            "worktree",
-            "remove",
-            e.worktree_path.to_str().unwrap(),
-            "--force",
-        ])
-        .output()
-        .map_err(|spawn_err| {
-            let err = format!("worktree remove spawn failed: {}", spawn_err);
-            let _ = mark_state(&e.id, &ShadowState::CleanupFailed, Some(err.clone()));
-            RecoveryError::Io(spawn_err)
-        })?;
-    if !out1.status.success() {
-        let stderr = String::from_utf8_lossy(&out1.stderr).to_string();
-        let err = format!("worktree remove failed: {}", stderr);
-        mark_state(&e.id, &ShadowState::CleanupFailed, Some(err.clone()))?;
-        return Err(RecoveryError::GitCommandError {
-            command: "git".to_string(),
-            args: "worktree remove".to_string(),
-            code: out1.status.code().unwrap_or(-1),
-            stderr,
-        });
+    if !e.branch.starts_with("reprodeck-shadow-") {
+        return Err(RecoveryError::UnsafeRecoveryEntry("unexpected branch name"));
+    }
+    let name_is_expected = e
+        .worktree_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("reprodeck-shadow-"));
+    if !name_is_expected {
+        return Err(RecoveryError::UnsafeRecoveryEntry(
+            "unexpected worktree directory name",
+        ));
+    }
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let worktree_boundary = if e.worktree_path.exists() {
+        e.worktree_path.canonicalize()?
+    } else {
+        let parent = e
+            .worktree_path
+            .parent()
+            .ok_or(RecoveryError::UnsafeRecoveryEntry("worktree has no parent"))?;
+        parent
+            .canonicalize()?
+            .join(e.worktree_path.file_name().unwrap_or_default())
+    };
+    if !worktree_boundary.starts_with(&temp_root) {
+        return Err(RecoveryError::UnsafeRecoveryEntry(
+            "worktree is outside the temporary directory",
+        ));
+    }
+    let worktree_path = e.worktree_path.to_str().ok_or_else(|| {
+        RecoveryError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "recovery worktree path is not valid UTF-8",
+        ))
+    })?;
+    if e.worktree_path.exists() {
+        let out1 = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["worktree", "remove", worktree_path, "--force"])
+            .output()
+            .map_err(|spawn_err| {
+                let err = format!("worktree remove spawn failed: {spawn_err}");
+                let _ = mark_state(&e.id, &ShadowState::CleanupFailed, Some(err));
+                RecoveryError::Io(spawn_err)
+            })?;
+        if !out1.status.success() && e.worktree_path.exists() {
+            let stderr = String::from_utf8_lossy(&out1.stderr).trim().to_owned();
+            mark_state(
+                &e.id,
+                &ShadowState::CleanupFailed,
+                Some(format!("worktree remove failed: {stderr}")),
+            )?;
+            return Err(RecoveryError::GitCommandError {
+                command: "git".to_string(),
+                args: "worktree remove".to_string(),
+                code: out1.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
     }
 
-    // run branch delete
-    let out2 = std::process::Command::new("git")
+    let _ = std::process::Command::new("git")
         .current_dir(repo)
-        .args(["branch", "-D", &e.branch])
-        .output()
-        .map_err(|spawn_err| {
-            let err = format!("branch delete spawn failed: {}", spawn_err);
-            let _ = mark_state(
+        .args(["worktree", "prune"])
+        .output();
+
+    let reference = format!("refs/heads/{}", e.branch);
+    let branch_exists = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["show-ref", "--verify", "--quiet", &reference])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if branch_exists {
+        let out2 = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["branch", "-D", &e.branch])
+            .output()
+            .map_err(|spawn_err| {
+                let err = format!("branch delete spawn failed: {spawn_err}");
+                let _ = mark_state(&e.id, &ShadowState::AppliedCleanupPending, Some(err));
+                RecoveryError::Io(spawn_err)
+            })?;
+        if !out2.status.success() {
+            let stderr = String::from_utf8_lossy(&out2.stderr).trim().to_owned();
+            mark_state(
                 &e.id,
                 &ShadowState::AppliedCleanupPending,
-                Some(err.clone()),
-            );
-            RecoveryError::Io(spawn_err)
-        })?;
-    if !out2.status.success() {
-        let stderr = String::from_utf8_lossy(&out2.stderr).to_string();
-        let err = format!("branch delete failed: {}", stderr);
-        // worktree removed but branch delete failed — keep pending
-        mark_state(
-            &e.id,
-            &ShadowState::AppliedCleanupPending,
-            Some(err.clone()),
-        )?;
-        return Err(RecoveryError::GitCommandError {
-            command: "git".to_string(),
-            args: format!("branch -D {}", e.branch),
-            code: out2.status.code().unwrap_or(-1),
-            stderr,
-        });
+                Some(format!("branch delete failed: {stderr}")),
+            )?;
+            return Err(RecoveryError::GitCommandError {
+                command: "git".to_string(),
+                args: format!("branch -D {}", e.branch),
+                code: out2.status.code().unwrap_or(-1),
+                stderr,
+            });
+        }
     }
 
-    // both succeeded
     mark_state(&e.id, &ShadowState::Applied, None)?;
     Ok(())
 }
@@ -270,7 +321,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cleanup_git_nonzero_exit_is_failure() {
+    fn missing_branch_is_treated_as_already_cleaned() {
         let td = tempdir().unwrap();
         let repo = td.path();
         // init repo
@@ -292,32 +343,28 @@ mod tests {
             .unwrap();
 
         // create a real worktree attached to a branch
-        let wt = td.path().join("shadow-wt");
+        let wt = td.path().join("reprodeck-shadow-wt");
         std::process::Command::new("git")
             .current_dir(repo)
             .args([
                 "worktree",
                 "add",
                 "-b",
-                "shadow-branch",
+                "reprodeck-shadow-branch",
                 wt.to_str().unwrap(),
                 "HEAD",
             ])
             .output()
             .unwrap();
 
-        // create recovery entry with non-existent branch so branch delete will fail
-        let id = create_pending(repo, "HEAD", &wt, "no-such-branch").unwrap();
+        // A previous cleanup may already have removed the branch. Retrying is idempotent.
+        let id = create_pending(repo, "HEAD", &wt, "reprodeck-shadow-missing").unwrap();
 
         let res = retry_cleanup(&id);
-        assert!(res.is_err());
+        assert!(res.is_ok());
 
-        // state should be AppliedCleanupPending
         let e = get_entry(&id).unwrap().unwrap();
-        assert!(matches!(
-            e.state,
-            ShadowState::AppliedCleanupPending | ShadowState::CleanupFailed
-        ));
+        assert!(matches!(e.state, ShadowState::Applied));
     }
 
     #[test]
@@ -341,14 +388,14 @@ mod tests {
             .output()
             .unwrap();
 
-        let wt = td.path().join("shadow2");
+        let wt = td.path().join("reprodeck-shadow-2");
         std::process::Command::new("git")
             .current_dir(repo)
             .args([
                 "worktree",
                 "add",
                 "-b",
-                "shadow2",
+                "reprodeck-shadow-2",
                 wt.to_str().unwrap(),
                 "HEAD",
             ])
@@ -356,10 +403,9 @@ mod tests {
             .unwrap();
 
         // create pending with wrong branch
-        let id = create_pending(repo, "HEAD", &wt, "no-branch").unwrap();
+        let id = create_pending(repo, "HEAD", &wt, "reprodeck-shadow-missing").unwrap();
         let r1 = retry_cleanup(&id);
-        // first attempt may fail; ensure state is pending or failed
-        assert!(r1.is_err());
+        assert!(r1.is_ok());
 
         // now fix entry to use actual branch name and retry
         mark_state(
@@ -372,17 +418,14 @@ mod tests {
         let conn = open_db().unwrap();
         conn.execute(
             "UPDATE shadow_recovery SET branch = ?1 WHERE id = ?2",
-            params!["shadow2", id],
+            params!["reprodeck-shadow-2", id],
         )
         .unwrap();
 
-        let _r2 = retry_cleanup(&id);
-        // second attempt should ideally succeed, but depending on environment may still fail; assert state is now Applied or still pending
+        let r2 = retry_cleanup(&id);
+        assert!(r2.is_ok());
         let e2 = get_entry(&id).unwrap().unwrap();
-        assert!(matches!(
-            e2.state,
-            ShadowState::Applied | ShadowState::AppliedCleanupPending | ShadowState::CleanupFailed
-        ));
+        assert!(matches!(e2.state, ShadowState::Applied));
     }
 
     #[test]
@@ -406,29 +449,25 @@ mod tests {
             .output()
             .unwrap();
 
-        let wt = td.path().join("shadow3");
+        let wt = td.path().join("reprodeck-shadow-3");
         std::process::Command::new("git")
             .current_dir(repo)
             .args([
                 "worktree",
                 "add",
                 "-b",
-                "shadow3",
+                "reprodeck-shadow-3",
                 wt.to_str().unwrap(),
                 "HEAD",
             ])
             .output()
             .unwrap();
 
-        let id = create_pending(repo, "HEAD", &wt, "shadow3").unwrap();
-        let _r1 = retry_cleanup(&id);
-        // second retry should be idempotent (either ok or same final state)
-        let _r2 = retry_cleanup(&id);
+        let id = create_pending(repo, "HEAD", &wt, "reprodeck-shadow-3").unwrap();
+        assert!(retry_cleanup(&id).is_ok());
+        assert!(retry_cleanup(&id).is_ok());
         let e = get_entry(&id).unwrap().unwrap();
-        assert!(matches!(
-            e.state,
-            ShadowState::Applied | ShadowState::AppliedCleanupPending | ShadowState::CleanupFailed
-        ));
+        assert!(matches!(e.state, ShadowState::Applied));
     }
 
     #[test]
@@ -452,24 +491,41 @@ mod tests {
             .output()
             .unwrap();
 
-        let wt = td.path().join("shadow4");
+        let wt = td.path().join("reprodeck-shadow-4");
         std::process::Command::new("git")
             .current_dir(repo)
             .args([
                 "worktree",
                 "add",
                 "-b",
-                "shadow4",
+                "reprodeck-shadow-4",
                 wt.to_str().unwrap(),
                 "HEAD",
             ])
             .output()
             .unwrap();
 
-        let id = create_pending(repo, "HEAD", &wt, "no-branch").unwrap();
+        let id = create_pending(repo, "HEAD", &wt, "reprodeck-shadow-missing").unwrap();
         let _ = retry_cleanup(&id);
         // ensure original file unchanged
         let v = std::fs::read_to_string(repo.join("d.txt")).unwrap();
         assert_eq!(v, "one");
+    }
+
+    #[test]
+    fn tampered_recovery_record_is_rejected_before_cleanup() {
+        let td = tempdir().unwrap();
+        let protected = td.path().join("reprodeck-shadow-protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("keep.txt"), "keep").unwrap();
+        let id = create_pending(td.path(), "HEAD", &protected, "main").unwrap();
+        assert!(matches!(
+            retry_cleanup(&id),
+            Err(RecoveryError::UnsafeRecoveryEntry("unexpected branch name"))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(protected.join("keep.txt")).unwrap(),
+            "keep"
+        );
     }
 }

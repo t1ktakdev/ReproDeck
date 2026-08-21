@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "reprodeck",
-  "version": "0.1.0",
-  "identifier": "com.user.reprodeck",
+  "productName": "ReproDeck",
+  "version": "0.3.0",
+  "identifier": "dev.reprodeck.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,24 +12,47 @@
   "app": {
     "windows": [
       {
-        "title": "reprodeck",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "ReproDeck",
+        "width": 1320,
+        "height": 820,
+        "minWidth": 1050,
+        "minHeight": 650,
+        "resizable": true,
+        "center": true,
+        "scrollBarStyle": "fluentOverlay"
       }
     ],
     "security": {
-      "csp": null
+      "freezePrototype": true,
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "devCsp": "default-src 'self' http://localhost:1420; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self' 'unsafe-eval' http://localhost:1420; object-src 'none'; base-uri 'none'; frame-src 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Evidence-first project intelligence and debugging agent",
+    "longDescription": "Open a codebase, understand its stack, investigate problems with inspectable context, reproduce failures in isolation, verify fixes with real checks and apply only reviewed patches.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "English",
+          "Russian"
+        ],
+        "displayLanguageSelector": true,
+        "installMode": "currentUser"
+      }
+    }
   }
 }

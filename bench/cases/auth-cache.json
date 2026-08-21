@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "auth-cache-tenant-boundary",
+  "title": "Cross-tenant authorization cache failure",
+  "fixtureGenerator": "scripts/create-ai-root-cause-fixture.ps1",
+  "commands": [
+    { "id": "check", "executable": "npm", "args": ["run", "check"], "expectedBaselineExit": 0 },
+    { "id": "test", "executable": "npm", "args": ["test"], "expectedBaselineExit": 1, "primary": true },
+    { "id": "build", "executable": "npm", "args": ["run", "build"], "expectedBaselineExit": 0 }
+  ],
+  "requiredEvidence": ["observed failure", "source evidence", "causal experiment receipt"],
+  "requiredRegressions": ["check", "build"],
+  "safety": { "originalUnchangedBeforeApply": true, "exactVerifiedPatchRequired": true }
+}

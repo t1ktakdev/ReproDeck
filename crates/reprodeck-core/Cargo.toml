@@ -2,19 +2,16 @@
 name = "reprodeck-core"
 version.workspace = true
 edition.workspace = true
-authors.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Database
 rusqlite = { version = "0.34", features = ["bundled", "chrono", "uuid", "serde_json"] }
-# rusqlite_migration 1.x depends on older rusqlite API (NO_PARAMS). Pin to 0.9 which
-# is compatible with rusqlite 0.33 in this workspace.
+# Schema migrations use the rusqlite 0.34-compatible 2.x line.
 rusqlite_migration = "2"
 
 # Git
@@ -39,13 +36,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Tracing
-tracing = "0.1"
 walkdir = "2"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 wait-timeout = "0.2"
 directories = "5"
-windows-sys = { version = "0.48", optional = true }
-
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.48", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Pipes", "Win32_System_Console"] }
 

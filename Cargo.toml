@@ -1,13 +1,12 @@
 [workspace]
-members = ["crates/*", "src-tauri", "tools/bridge_tester"]
+members = ["crates/*", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["ReproDeck Team"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/user/reprodeck"
+license = "MIT"
+repository = "https://github.com/t1ktakdev/ReproDeck"
 
 [profile.release]
 codegen-units = 1

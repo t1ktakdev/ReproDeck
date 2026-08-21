@@ -12,6 +12,16 @@ dist
 dist-ssr
 *.local
 
+# Local configuration and application data
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.reprodeck
+
 # Rust / Cargo
 target/
 **/target/
@@ -47,22 +57,6 @@ src-tauri/target/
 *.sln
 *.sw?
 
-# Private/runtime/build artifacts
-.env
-.env.*
-*.key
-*.pem
-*.pfx
-*.p12
-id_rsa*
-*.db
-*.sqlite
-*.sqlite3
-.cache/
-**/.cache/
-.opencode/node_modules/
-node_modules/
-**/node_modules/
-dist/
-**/dist/
-
+# Local field-test output
+field-test-logs/
+bench-results/

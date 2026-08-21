@@ -15,6 +15,9 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Option<HashMap<String, String>>,
+    /// When true, the child starts without inheriting the parent environment.
+    /// Callers can then provide an explicit allow-listed environment through `env`.
+    pub clear_env: bool,
     /// optional timeout
     pub timeout: Option<Duration>,
     /// max bytes to collect per stream
@@ -71,6 +74,9 @@ pub fn run_command(
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
+    if spec.clear_env {
+        cmd.env_clear();
+    }
     if let Some(envs) = &spec.env {
         for (k, v) in envs {
             cmd.env(k, v);
@@ -114,7 +120,9 @@ pub fn run_command(
             if n == 0 {
                 break;
             }
-            let mut out = out_clone.lock().unwrap();
+            let mut out = out_clone
+                .lock()
+                .map_err(|_| std::io::Error::other("stdout buffer lock poisoned"))?;
             if out.len() < limit {
                 let space = limit - out.len();
                 let to_take = std::cmp::min(space, n);
@@ -140,7 +148,9 @@ pub fn run_command(
             if n == 0 {
                 break;
             }
-            let mut out = err_clone.lock().unwrap();
+            let mut out = err_clone
+                .lock()
+                .map_err(|_| std::io::Error::other("stderr buffer lock poisoned"))?;
             if out.len() < limit {
                 let space = limit - out.len();
                 let to_take = std::cmp::min(space, n);
@@ -224,8 +234,14 @@ pub fn run_command(
 
     let finished_at = Instant::now();
 
-    let out = out_buf.lock().unwrap().clone();
-    let err = err_buf.lock().unwrap().clone();
+    let out = out_buf
+        .lock()
+        .map_err(|_| CommandError::Io(std::io::Error::other("stdout buffer lock poisoned")))?
+        .clone();
+    let err = err_buf
+        .lock()
+        .map_err(|_| CommandError::Io(std::io::Error::other("stderr buffer lock poisoned")))?
+        .clone();
 
     if timed_out {
         return Err(CommandError::Timeout);
@@ -254,6 +270,7 @@ pub struct SanitizedCommandRecord {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, RedactionResult)>,
+    pub clear_env: bool,
     pub timeout_secs: Option<u64>,
     pub output_limit: Option<usize>,
 }
@@ -271,6 +288,7 @@ pub fn sanitize_command_record(spec: &CommandSpec) -> SanitizedCommandRecord {
         args: spec.args.clone(),
         cwd,
         env: envs,
+        clear_env: spec.clear_env,
         timeout_secs: spec.timeout.map(|d| d.as_secs()),
         output_limit: spec.output_limit,
     }
@@ -290,6 +308,7 @@ mod tests {
             args: vec!["--version".into()],
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -304,6 +323,7 @@ mod tests {
             args: vec!["--version".into()],
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -318,6 +338,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -332,6 +353,7 @@ mod tests {
             args: vec!["--version".into()],
             cwd: Some(PathBuf::from("/no/such/dir")),
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -347,6 +369,7 @@ mod tests {
             args: vec![],
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: Some(Duration::from_secs(1)),
             output_limit: Some(1024),
         };
@@ -373,6 +396,7 @@ mod tests {
             args: vec!["MY_SECRET".into()],
             cwd: None,
             env: Some(env.clone()),
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -388,6 +412,7 @@ mod tests {
             args: vec!["--version".into()],
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -412,6 +437,7 @@ mod tests {
             args,
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: Some(Duration::from_millis(200)),
             output_limit: None,
         };
@@ -436,6 +462,7 @@ mod tests {
             args,
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: None,
             output_limit: None,
         };
@@ -580,6 +607,7 @@ mod tests {
             args,
             cwd: None,
             env: None,
+            clear_env: false,
             timeout: Some(std::time::Duration::from_secs(60)),
             output_limit: None,
         };

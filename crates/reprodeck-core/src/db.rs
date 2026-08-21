@@ -209,6 +209,230 @@ const MIGRATIONS: &[(&str, &str)] = &[
             FOREIGN KEY(run_id) REFERENCES verification_runs(id) ON DELETE CASCADE
         );"
     ),
+    (
+        "5",
+        "CREATE INDEX IF NOT EXISTS idx_repositories_path ON repositories(path);
+
+        CREATE TABLE IF NOT EXISTS environment_snapshots (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            captured_at INTEGER NOT NULL,
+            os TEXT NOT NULL,
+            arch TEXT NOT NULL,
+            git_version TEXT,
+            runtimes_json TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_environment_session ON environment_snapshots(session_id);
+
+        CREATE TABLE IF NOT EXISTS reproduction_steps (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            ordering INTEGER NOT NULL DEFAULT 0,
+            executable TEXT NOT NULL,
+            args_json TEXT NOT NULL,
+            expected_exit_code INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_reproduction_steps_session ON reproduction_steps(session_id, ordering);
+
+        CREATE TABLE IF NOT EXISTS reproduction_runs (
+            id TEXT PRIMARY KEY,
+            step_id TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK(phase IN ('Before','After')),
+            action_id TEXT NOT NULL,
+            receipt_id TEXT,
+            exit_code INTEGER,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(step_id) REFERENCES reproduction_steps(id) ON DELETE CASCADE,
+            FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE CASCADE,
+            FOREIGN KEY(receipt_id) REFERENCES receipts(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reproduction_runs_step ON reproduction_runs(step_id, phase, created_at);
+        "
+    ),
+    (
+        "6",
+        "ALTER TABLE reproduction_steps ADD COLUMN active_cycle INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE reproduction_runs ADD COLUMN cycle INTEGER NOT NULL DEFAULT 1;
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_items (
+            created_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE NOT NULL,
+            session_id TEXT NOT NULL,
+            action_id TEXT,
+            receipt_id TEXT,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            artifact_id TEXT,
+            checksum TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE SET NULL,
+            FOREIGN KEY(receipt_id) REFERENCES receipts(id) ON DELETE SET NULL,
+            FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_items_session ON evidence_items(session_id, created_seq);
+
+        CREATE TABLE IF NOT EXISTS imported_capsules (
+            id TEXT PRIMARY KEY,
+            source_path TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            session_id TEXT,
+            title TEXT,
+            format_version INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            imported_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_imported_capsules_imported_at ON imported_capsules(imported_at DESC);
+        "
+    ),
+    (
+        "7",
+        "CREATE TABLE IF NOT EXISTS project_profiles (
+            root_path TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            analyzed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_profiles_analyzed_at ON project_profiles(analyzed_at DESC);
+        "
+    ),
+    (
+        "8",
+        "CREATE TABLE IF NOT EXISTS project_health_runs (
+            id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            report_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_health_runs_root_finished ON project_health_runs(root_path, finished_at DESC);
+
+        CREATE TABLE IF NOT EXISTS project_problems (
+            id TEXT PRIMARY KEY,
+            problem_key TEXT UNIQUE NOT NULL,
+            root_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            health_run_id TEXT NOT NULL,
+            check_run_id TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            cleared_at INTEGER,
+            occurrences INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(health_run_id) REFERENCES project_health_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_problems_root_last_seen ON project_problems(root_path, last_seen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_project_problems_command ON project_problems(root_path, command_id);
+        "
+    ),
+    (
+        "9",
+        "CREATE TABLE IF NOT EXISTS investigation_cases (
+            id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            repo_root TEXT NOT NULL,
+            project_relative_path TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            health_run_id TEXT NOT NULL,
+            cluster_id TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            state TEXT NOT NULL,
+            case_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(health_run_id, cluster_id),
+            FOREIGN KEY(health_run_id) REFERENCES project_health_runs(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_investigation_cases_root_updated ON investigation_cases(root_path, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS investigation_workspaces (
+            case_id TEXT PRIMARY KEY,
+            repo_root TEXT NOT NULL,
+            project_relative_path TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            worktree_path TEXT NOT NULL,
+            original_head TEXT NOT NULL,
+            original_branch TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY(case_id) REFERENCES investigation_cases(id) ON DELETE CASCADE
+        );
+        "
+    ),
+    (
+        "10",
+        "CREATE TABLE IF NOT EXISTS verification_handoffs (
+            session_id TEXT PRIMARY KEY,
+            investigation_case_id TEXT NOT NULL,
+            hypothesis_id TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            source_commit TEXT NOT NULL,
+            patch_sha256 TEXT NOT NULL,
+            patch_size INTEGER NOT NULL,
+            patch_bytes BLOB NOT NULL,
+            files_json TEXT NOT NULL,
+            activated_at INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_proofs (
+            session_id TEXT PRIMARY KEY,
+            step_id TEXT NOT NULL,
+            cycle INTEGER NOT NULL,
+            source_commit TEXT NOT NULL,
+            source_state_sha256 TEXT NOT NULL,
+            shadow_commit TEXT NOT NULL,
+            patch_sha256 TEXT NOT NULL,
+            patch_size INTEGER NOT NULL,
+            files_json TEXT NOT NULL,
+            criterion_sha256 TEXT NOT NULL,
+            command_sha256 TEXT NOT NULL,
+            after_run_id TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(step_id) REFERENCES reproduction_steps(id) ON DELETE CASCADE,
+            FOREIGN KEY(after_run_id) REFERENCES reproduction_runs(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS regression_checks (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            stable_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            executable TEXT NOT NULL,
+            args_json TEXT NOT NULL,
+            expected_exit_code INTEGER NOT NULL DEFAULT 0,
+            level TEXT NOT NULL CHECK(level IN ('Required','Recommended','Optional')),
+            status TEXT NOT NULL DEFAULT 'Pending',
+            receipt_id TEXT,
+            verified_patch_sha256 TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(session_id, stable_id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(receipt_id) REFERENCES receipts(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_regression_checks_session ON regression_checks(session_id, level, created_at);"
+    ),
 ];
 
 fn current_migration_version() -> i64 {
@@ -250,13 +474,18 @@ fn apply_migrations(conn: &mut Connection) -> MResult<()> {
     }
 
     for i in (current as usize + 1)..=MIGRATIONS.len() {
-        let (ver, sql) = MIGRATIONS.get(i - 1).unwrap();
+        let (ver, sql) = MIGRATIONS
+            .get(i - 1)
+            .ok_or_else(|| MigrationError::MigrationFailed(format!("missing migration {i}")))?;
+        let parsed_version = ver.parse::<i64>().map_err(|_| {
+            MigrationError::MigrationFailed(format!("invalid migration version {ver}"))
+        })?;
         // execute migration inside a Rust-owned transaction
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO reprodeck_meta(key,value) VALUES('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
-            params![ver.parse::<i64>().unwrap().to_string()],
+            params![parsed_version.to_string()],
         )?;
         tx.commit()?;
     }

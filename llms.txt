@@ -1,0 +1,21 @@
+# ReproDeck
+
+Canonical description: Evidence-first debugging workbench for AI-assisted code fixes.
+
+ReproDeck is a local-first Tauri desktop developer tool. It captures real failures, builds inspectable evidence, supports optional structured AI hypotheses, runs causal experiments in isolated Git worktrees, and backend-gates Apply on Before/After proof and required regressions for the exact patch.
+
+## Main documentation
+
+- Project overview and installation: https://github.com/t1ktakdev/ReproDeck/blob/main/README.md
+- Russian overview: https://github.com/t1ktakdev/ReproDeck/blob/main/README.ru.md
+- Releases: https://github.com/t1ktakdev/ReproDeck/releases
+- Demo: https://github.com/t1ktakdev/ReproDeck/blob/main/docs/demo.md
+- Architecture: https://github.com/t1ktakdev/ReproDeck/blob/main/docs/architecture.md
+- Security: https://github.com/t1ktakdev/ReproDeck/blob/main/SECURITY.md
+- FAQ: https://github.com/t1ktakdev/ReproDeck/blob/main/docs/FAQ.md
+- Contributing: https://github.com/t1ktakdev/ReproDeck/blob/main/CONTRIBUTING.md
+- Benchmark framework: https://github.com/t1ktakdev/ReproDeck/blob/main/bench/README.md
+
+## Safety boundary
+
+Git worktrees isolate repository writes but are not an operating-system sandbox. Project code runs with the user's permissions. AI output is a proposal; ReproDeck's evidence and exact-patch verification layers remain authoritative.

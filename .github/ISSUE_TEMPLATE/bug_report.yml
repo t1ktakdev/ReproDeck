@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible ReproDeck problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ReproDeck. Remove tokens, private paths, proprietary source, and other sensitive data before submitting. Do not use a public issue for a security vulnerability.
+  - type: input
+    id: version
+    attributes:
+      label: ReproDeck version
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 24H2, x64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Prefer a minimal repository or a sanitized capsule. Do not attach private source.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant sanitized logs or receipts
+      description: Paste only the smallest relevant excerpt. Remove secrets, tokens, personal paths, and proprietary data.
+      render: shell
+  - type: dropdown
+    id: original_repo
+    attributes:
+      label: Did the original repository change unexpectedly?
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Git/runtime versions, project stack, or a link to a safe minimal reproduction.

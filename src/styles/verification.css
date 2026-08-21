@@ -1,0 +1,58 @@
+/* Exact verification proof: one work surface with dividers, not nested cards. */
+.verification-page { padding-bottom: 88px; }
+.verification-page > .view-heading .verdict { max-width: 360px; white-space: normal; text-align: right; }
+.proof-chain, .regression-contract { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--surface-1); }
+.proof-chain > header, .regression-contract > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 17px 22px; border-bottom: 1px solid var(--border-subtle); }
+.proof-chain h3, .regression-contract h3, .wizard-regressions h3 { margin: 0; font-size: 16px; font-weight: 620; }
+.proof-chain header p, .regression-contract header p, .wizard-regressions header p { margin: 3px 0 0; color: var(--muted); }
+.proof-chain > header > span { color: var(--muted); font-size: 13px; }
+.proof-chain-flow { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); }
+.proof-chain-flow article { min-width: 0; min-height: 112px; display: flex; flex-direction: column; gap: 6px; padding: 15px 16px; border-right: 1px solid var(--border-subtle); }
+.proof-chain-flow article:last-child { border-right: 0; }
+.proof-chain-flow article small { color: var(--faint); font-size: 12px; }
+.proof-chain-flow article strong { font-size: 14px; font-weight: 620; }
+.proof-chain-flow article span { overflow: hidden; color: var(--muted); font-family: "Cascadia Code","Segoe UI Mono",monospace; font-size: 12px; text-overflow: ellipsis; }
+.proof-chain-flow article.complete { box-shadow: inset 0 2px var(--success); }
+.proof-chain-flow article.pending { box-shadow: inset 0 2px var(--border-strong); }
+.verification-facts { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; border-bottom: 1px solid var(--border); }
+.verification-facts > div { min-width: 0; min-height: 98px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 15px 18px; border-right: 1px solid var(--border-subtle); }
+.verification-facts > div:last-child { border-right: 0; }
+.verification-facts small { color: var(--faint); }
+.verification-facts code { max-width: 100%; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.verification-facts span { color: var(--muted); font-size: 12px; }
+.proof-links { border-bottom: 1px solid var(--border); background: var(--surface-2); }
+.proof-links summary { min-height: 42px; display: flex; align-items: center; padding: 0 20px; cursor: pointer; }
+.proof-links dl { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); margin: 0; border-top: 1px solid var(--border-subtle); }
+.proof-links dl div { min-width: 0; padding: 12px 18px; border-right: 1px solid var(--border-subtle); }
+.proof-links dt { margin-bottom: 4px; color: var(--faint); font-size: 12px; }
+.proof-links dd { margin: 0; overflow-wrap: anywhere; }
+.regression-contract { margin-top: 18px; }
+.regression-row { min-height: 64px; display: grid; grid-template-columns: 24px minmax(220px,1fr) auto auto auto; align-items: center; gap: 12px; padding: 9px 18px; border-bottom: 1px solid var(--border-subtle); }
+.regression-row:last-child { border-bottom: 0; }
+.regression-row > div { min-width: 0; display: grid; grid-template-columns: minmax(120px,.7fr) minmax(180px,1.3fr); align-items: baseline; gap: 12px; }
+.regression-row strong { font-weight: 600; }
+.regression-row code, .regression-row small { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.regression-row small { grid-column: 1 / -1; }
+.regression-level { color: var(--muted); font-size: 12px; }
+.level-required { color: var(--warning); }
+.patch-proof-strip { min-height: 58px; display: grid; grid-template-columns: 1fr 1fr 140px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--surface-1); }
+.patch-proof-strip > div { display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 8px 16px; border-right: 1px solid var(--border-subtle); }
+.patch-proof-strip small { color: var(--faint); }
+.patch-proof-strip code { color: var(--text); }
+.patch-proof-strip.ready { box-shadow: inset 3px 0 var(--success); }
+.patch-proof-strip.blocked { box-shadow: inset 3px 0 var(--danger); }
+.wizard-regressions { margin-top: 16px; border-top: 1px solid var(--border); }
+.wizard-regressions > header { padding: 14px 0 10px; }
+.wizard-regressions > div { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-top: 1px solid var(--border-subtle); }
+.wizard-regressions > div > span { display: flex; align-items: center; gap: 10px; }
+.wizard-regressions code { color: var(--muted); font-size: 12px; }
+
+@media (max-width: 1180px) {
+  .proof-chain-flow { grid-template-columns: 1fr; }
+  .proof-chain-flow article { min-height: 72px; border-right: 0; border-bottom: 1px solid var(--border-subtle); }
+  .verification-facts { grid-template-columns: 1fr 1fr; }
+  .verification-facts > div:nth-child(2) { border-right: 0; }
+  .proof-links dl { grid-template-columns: 1fr 1fr; }
+  .regression-row { grid-template-columns: 24px minmax(0,1fr) auto; }
+  .regression-row > button { grid-column: auto; }
+}
