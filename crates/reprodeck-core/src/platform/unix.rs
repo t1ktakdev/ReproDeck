@@ -75,9 +75,9 @@ pub fn spawn_process(
                 // negative pid means kill the process group
                 let r = unsafe { libc::kill(-pid, libc::SIGKILL) };
                 if r == 0 {
-                    return Ok(());
+                    Ok(())
                 } else {
-                    return Err(std::io::Error::last_os_error());
+                    Err(std::io::Error::last_os_error())
                 }
             }
             #[cfg(not(unix))]
