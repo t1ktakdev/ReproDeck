@@ -87,8 +87,8 @@ fn build_command_line(program: &str, args: &[String]) -> Vec<u16> {
 }
 
 pub trait ProcessHandle {
-    fn take_stdout(&mut self) -> Option<File>;
-    fn take_stderr(&mut self) -> Option<File>;
+    fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>>;
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>>;
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
     fn kill(&mut self) -> std::io::Result<()>;
@@ -465,11 +465,15 @@ pub fn spawn_process(
             err: Option<File>,
         }
         impl ProcessHandle for WinHandle {
-            fn take_stdout(&mut self) -> Option<File> {
-                self.out.take()
+            fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+                self.out
+                    .take()
+                    .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>)
             }
-            fn take_stderr(&mut self) -> Option<File> {
-                self.err.take()
+            fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+                self.err
+                    .take()
+                    .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>)
             }
             fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
                 let s = unsafe { WaitForSingleObject(self.proc, 0) };

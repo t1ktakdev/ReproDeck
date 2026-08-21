@@ -3,8 +3,8 @@ use std::process::Child;
 use std::time::Duration;
 
 pub trait ProcessHandle {
-    fn take_stdout(&mut self) -> Option<std::fs::File>;
-    fn take_stderr(&mut self) -> Option<std::fs::File>;
+    fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>>;
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>>;
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
     fn kill(&mut self) -> std::io::Result<()>;
@@ -32,23 +32,34 @@ pub fn spawn_process(
     #[cfg(not(target_os = "android"))]
     {
         use std::os::unix::process::CommandExt;
-        cmd.before_exec(|| {
-            // setpgid(0,0) makes child its own process group leader
-            unsafe { libc::setpgid(0, 0) };
-            Ok(())
-        });
+        unsafe {
+            cmd.pre_exec(|| {
+                // setpgid(0,0) makes child its own process group leader.
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
     }
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| CommandError::SpawnFailed(e.to_string()))?;
     struct StdChildHandle(std::process::Child);
     impl ProcessHandle for StdChildHandle {
-        fn take_stdout(&mut self) -> Option<std::fs::File> {
-            self.0.stdout.take()
+        fn take_stdout(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+            self.0
+                .stdout
+                .take()
+                .map(|stdout| Box::new(stdout) as Box<dyn std::io::Read + Send>)
         }
-        fn take_stderr(&mut self) -> Option<std::fs::File> {
-            self.0.stderr.take()
+        fn take_stderr(&mut self) -> Option<Box<dyn std::io::Read + Send>> {
+            self.0
+                .stderr
+                .take()
+                .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>)
         }
         fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             self.0.try_wait()
