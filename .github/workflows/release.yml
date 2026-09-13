@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) {
+            throw "Release tags must start with v"
+          }
+
+          $version = $tag.Substring(1)
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoText = Get-Content Cargo.toml -Raw
+          $cargoMatch = [regex]::Match(
+            $cargoText,
+            '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"'
+          )
+
+          if (-not $cargoMatch.Success) {
+            throw "Could not read workspace.package.version from Cargo.toml"
+          }
+
+          $cargoVersion = $cargoMatch.Groups[1].Value
+          $versions = @{
+            "package.json" = $packageVersion
+            "src-tauri/tauri.conf.json" = $tauriVersion
+            "Cargo.toml" = $cargoVersion
+          }
+
+          foreach ($entry in $versions.GetEnumerator()) {
+            if ($entry.Value -ne $version) {
+              throw "$($entry.Key) has version $($entry.Value), expected $version from tag $tag"
+            }
+          }
+
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit
+
+      - name: Rust format
+        run: cargo fmt --all -- --check
+
+      - name: Rust check
+        run: cargo check --workspace --all-targets
+
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace --all-targets
+
+      - name: Frontend typecheck
+        run: npm run typecheck
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Build NSIS installer
+        run: npm run release:windows
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "target/release/bundle/nsis" -Filter "*.exe" |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "Tauri did not produce an NSIS installer"
+          }
+
+          New-Item -ItemType Directory -Force -Path dist-release | Out-Null
+          $assetName = "ReproDeck_$env:RELEASE_VERSION`_x64-setup.exe"
+          $assetPath = Join-Path "dist-release" $assetName
+          Copy-Item $installer.FullName $assetPath
+
+          $hash = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $assetName" | Set-Content -Encoding ascii "dist-release/SHA256SUMS.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReproDeck-${{ env.RELEASE_VERSION }}-windows-x64
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist-release/*.exe
+            dist-release/SHA256SUMS.txt
