@@ -113,7 +113,7 @@ jobs:
           "$hash  $assetName" | Set-Content -Encoding ascii "dist-release/SHA256SUMS.txt"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ReproDeck-${{ env.RELEASE_VERSION }}-windows-x64
           path: dist-release/*
