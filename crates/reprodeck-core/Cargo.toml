@@ -37,7 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 walkdir = "2"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 wait-timeout = "0.2"
 directories = "5"
 [target.'cfg(windows)'.dependencies]
